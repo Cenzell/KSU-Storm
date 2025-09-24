@@ -1,0 +1,202 @@
+import { Button, VerticalBox, TabWidget } from "std-widgets.slint";
+
+component JoystickBox inherits Rectangle {
+    in property<float> stick_x;
+    in property<float> stick_y;
+    in property<string> label_text;
+    in property <string> last_event;
+
+    width: 150px;
+    height: 150px;
+    border-radius: 75px;
+    border-width: 2px;
+    border-color: #aaaaaa;
+    background: #303030;
+
+    // Position Dot
+    Rectangle {
+        width: 16px;
+        height: 16px;
+        x: (parent.width - self.width) / 2 + (stick_x * (parent.width - self.width) / 2);
+        y: (parent.height - self.height) / 2 + (stick_y * (parent.height - self.height) / 2);
+        background: #66ccff;
+        border-radius: 8px;
+    }
+
+    Text {
+        text: label_text;
+        x: parent.width/2 - self.width/2;
+        y: parent.height + 4px;
+        font-size: 14px;
+        color: #dddddd;
+    }
+
+
+    Text {
+        text: last_event;
+        font-size: 16px;
+        color: #dddddd;
+    }
+}
+
+
+component ButtonIndicator inherits Rectangle {
+    in property<bool> active;
+    in property<string> label_text;
+    in property<brush> indicator_color;
+
+    width: 40px;
+    height: 40px;
+    border-radius: 20px;
+    background: active ? indicator_color : #555555;
+
+    Text {
+        text: label_text;
+        y: parent.height + 4px;
+        x: parent.width/2 - self.width/2;
+        font-size: 12px;
+        color: #dddddd;
+    }
+}
+
+export component AppWindow inherits Window {
+    width: 1920px;
+    height: 1080px;
+    title: "Wild Robot Driver Station";
+
+    in property<float> lx; // left X
+    in property<float> ly; // left Y
+    in property<float> rx; // right X
+    in property<float> ry; // right Y
+
+    in property<bool> btn_cross;
+    in property<bool> btn_circle;
+    in property<bool> btn_square;
+    in property<bool> btn_triangle;
+    in property<bool> btn_l1;
+    in property<bool> btn_r1;
+
+    in property <bool> connected: false;
+    in property <string> telemetry;
+
+    HorizontalLayout {
+        padding: 10px;
+        spacing: 20px;
+        alignment: center;
+
+        VerticalLayout {
+            Rectangle {
+                height: 30%;
+                width: 32%;
+                border-radius: 5px;
+                border-width: 5px;
+                border-color: white;
+        
+                Text {
+                    y: 5px;
+                    text: "Controller Monitor";
+                    font-size: 20px;
+                    color: #ffffff;
+                    //horizontal-alignment: center;
+                }
+
+                Text {
+                    y: 35px;
+                    text: "Status : Connected";
+                    font-size: 14px;
+                    color: #ffffff;
+                    //horizontal-alignment: center;
+                }
+        
+                HorizontalLayout {
+                    spacing: 40px;
+                    alignment: center;
+        
+                    // LEFT STICK
+                    JoystickBox {
+                        //x: 20px;
+                        y: 50px;
+                        stick_x: lx;
+                        stick_y: ly;
+                        label_text: "Left Stick";
+                    }
+        
+                    // RIGHT STICK
+                    JoystickBox {
+                        y: 50px;
+                        stick_x: rx;
+                        stick_y: ry;
+                        label_text: "Right Stick";
+                    }
+                }
+                Rectangle {
+                    y: 230px;
+                    //padding: 5px;
+                    HorizontalLayout {
+                        alignment: center;
+                        spacing: 10px;
+
+                        ButtonIndicator { label_text: "Square"; active: btn_square; indicator_color: #00ccff; }
+                        ButtonIndicator { label_text: "Triangle"; active: btn_triangle; indicator_color: #66ff66; }
+                        ButtonIndicator { label_text: "Circle"; active: btn_circle; indicator_color: #ff6666; }
+                        ButtonIndicator { label_text: "Cross"; active: btn_cross; indicator_color: #ccccff; }
+                        ButtonIndicator { label_text: "L1"; active: btn_l1; indicator_color: #ffaa00; }
+                        ButtonIndicator { label_text: "R1"; active: btn_r1; indicator_color: #ffaa00; }
+                    }
+                }
+            }
+
+        }
+        VerticalLayout {
+            Rectangle {
+                width: 32%;
+                height: 60px;
+                border-radius: 5px;
+                border-width: 5px;
+                border-color: white;
+                Text {
+                    y: 15px;
+                    text: "Robot";
+                    font-size: 20px;
+                    color: #ffffff;
+                    horizontal-alignment: center;
+                }
+                Rectangle {
+                    Text {
+                    text: "Connection Status: ";
+                        x: 10px;
+                        y: 30px;
+                    }
+                    Text {
+                        text: connected ? "Connected" : "Disconnected";
+                        color: connected ? #00ff00 : #ff0000;
+                        x: 125px;
+                        y: 30px;
+                    }
+                }
+            }
+        }
+        VerticalLayout {            
+            Rectangle {
+                width: 32%;
+                height: 30px;
+                border-radius: 5px;
+                border-width: 5px;
+                border-color: white;
+                Text {
+                    text: "Temp";
+                    font-size: 20px;
+                    color: #ffffff;
+                    horizontal-alignment: center;
+                }
+                Button {
+                    text: "Test Button";
+                    width: 100px;
+                    height: 30px;
+                    x: parent.width/2 - self.width/2;
+                    y: 40px;
+                }
+            }
+        }
+    }
+}

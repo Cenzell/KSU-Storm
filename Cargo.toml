@@ -1,0 +1,21 @@
+[package]
+name = "robo-comm"
+version = "0.0.1"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+serialport = "4"
+gilrs = "0.11.0"
+slint = "1.13.1"
+
+[build-dependencies]
+slint-build = "1.13.1"
+
+[[bin]]
+name = "driver"
+path = "src/driver.rs"
+
+[[bin]]
+name = "robot"
+path = "src/robot.rs"
