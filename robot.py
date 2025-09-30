@@ -2,12 +2,31 @@ import socket
 import threading
 import time
 
+HEARTBEAT_TIME = 0.5
+last_heartbeat = time.time()
+heartbeat_lock = threading.Lock()
+connection_lost = False
+
 class JoystickData:
     def __init__(self, lx=0.0, ly=0.0, rx=0.0, ry=0.0):
         self.lx = lx
         self.ly = ly
         self.rx = rx
         self.ry = ry
+
+def all_stop():
+    if(not connection_lost): print("!!!! Connection Stop Triggered !!!!")
+    #Need to develope a better method to stop all motors safely
+
+def watchdog_thread(): 
+    global connection_lost
+    while True:
+        with heartbeat_lock:
+            if time.time() - last_heartbeat > HEARTBEAT_TIME:
+                if not connection_lost:
+                    all_stop()
+                    connection_lost = True
+        time.sleep(0.1)
 
 def calculate_motor_speeds(data: JoystickData) -> list[float]:
     """Calculates mecanum drive motor speeds."""
@@ -90,12 +109,16 @@ def handle_client(conn, addr):
         print(f"An error occurred with client {addr}: {e}")
     finally:
         print(f"Client disconnected: {addr}")
+        is_stoped = True
         conn.close()
 
 def main():
     """Main function to start the TCP server."""
     host = '0.0.0.0'
     port = 5000
+
+    watchdog = threading.Thread(target=watchdog_thread, daemon=True)
+    watchdog.start()
     
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server_socket:
         server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -104,6 +127,7 @@ def main():
         print(f"🤖 Robot TCP server listening on port {port}...")
         
         while True:
+            is_stoped = False
             conn, addr = server_socket.accept()
             client_thread = threading.Thread(target=handle_client, args=(conn, addr))
             client_thread.daemon = True

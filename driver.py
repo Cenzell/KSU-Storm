@@ -70,7 +70,7 @@ class ConnectionManager(threading.Thread):
                     print(f"Trying to connect to: {host}:{port}")
                     try:
                         new_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                        new_sock.settimeout(2.0)
+                        new_sock.settimeout(1.0)
                         new_sock.connect((host, port))
                         new_sock.settimeout(None)
                         self.sock = new_sock
@@ -80,7 +80,7 @@ class ConnectionManager(threading.Thread):
                         print(f"🔌 Connection to {address_str} failed: {e}")
                         self.signals.connection_status.emit(False, "")
                         address_idx = (address_idx + 1) % len(ROBOT_ADDRESSES)
-            time.sleep(1)
+            time.sleep(0.2)
 
     def get_socket(self):
         with self.lock:
