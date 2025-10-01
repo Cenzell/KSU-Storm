@@ -7,7 +7,7 @@ from PyQt6.QtWidgets import QApplication, QMainWindow, QWidget, QVBoxLayout, QLa
 from PyQt6.QtCore import QTimer, QObject, pyqtSignal, Qt
 
 ROBOT_ADDRESSES = [
-    "wildrobo.local:5000",
+    #"wildrobo.local:5000",
     "10.42.0.85:5000",
     "127.0.0.1:5000",
 ]
