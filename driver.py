@@ -3,8 +3,9 @@ import socket
 import threading
 import time
 import pygame
-from PyQt6.QtWidgets import QApplication, QMainWindow, QWidget, QVBoxLayout, QLabel, QGridLayout
-from PyQt6.QtCore import QTimer, QObject, pyqtSignal, Qt
+from PyQt6.QtWidgets import QApplication, QMainWindow
+from PyQt6.QtCore import QTimer, QObject, pyqtSignal
+from PyQt6 import uic
 
 ROBOT_ADDRESSES = [
     #"wildrobo.local:5000",
@@ -100,51 +101,7 @@ class ConnectionManager(threading.Thread):
 class AppWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Driver Station")
-        self.setGeometry(100, 100, 400, 200)
-
-        self.status_label = QLabel("Status: Disconnected")
-        self.address_label = QLabel("Address: N/A")
-        self.gamepad_label = QLabel("Gamepad: Not Found")
-        self.ping_label = QLabel("Ping: -- ms")
-        self.lx_label = QLabel("LX: 0.00")
-        self.ly_label = QLabel("LY: 0.00")
-        self.rx_label = QLabel("RX: 0.00")
-        self.ry_label = QLabel("RY: 0.00")
-        
-        layout = QGridLayout()
-        layout.addWidget(self.status_label, 0, 0, 1, 2)
-        layout.addWidget(self.address_label, 1, 0, 1, 2)
-        layout.addWidget(self.gamepad_label, 2, 0, 1, 2)
-        layout.addWidget(self.ping_label, 3, 0, 1, 2)
-        layout.addWidget(self.lx_label, 4, 0)
-        layout.addWidget(self.ly_label, 4, 1)
-        layout.addWidget(self.rx_label, 5, 0)
-        layout.addWidget(self.ry_label, 5, 1)
-
-        self.button_a_label = QLabel("A")
-        self.button_b_label = QLabel("B")
-        self.button_x_label = QLabel("X")
-        self.button_y_label = QLabel("Y")
-
-        self.button_a_label.setStyleSheet("color: lightgray")
-        self.button_b_label.setStyleSheet("color: lightgray")
-        self.button_x_label.setStyleSheet("color: lightgray")
-        self.button_y_label.setStyleSheet("color: lightgray")
-        
-        self.button_a_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.button_b_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.button_x_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.button_y_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-
-        layout.addWidget(self.button_a_label, 6, 0)
-        layout.addWidget(self.button_b_label, 6, 1)
-        layout.addWidget(self.button_x_label, 6, 2)
-        layout.addWidget(self.button_y_label, 6, 3)
-
-        container = QWidget()
-        container.setLayout(layout)
-        self.setCentralWidget(container)
+        uic.loadUi("driver_station.ui", self)
 
         self.joystick = None
         self.init_pygame_and_joystick()
