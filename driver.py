@@ -1,102 +1,14 @@
 import sys
 import socket
-import threading
 import time
 import pygame
 from PyQt6.QtWidgets import QApplication, QMainWindow
-from PyQt6.QtCore import QTimer, QObject, pyqtSignal
+from PyQt6.QtCore import QTimer
 from PyQt6 import uic
+import comm
 
-ROBOT_ADDRESSES = [
-    #"wildrobo.local:5000",
-    "10.42.0.85:5000",
-    "127.0.0.1:5000",
-]
 GAMEPAD_POLL_RATE_MS = 20
 PING_INTERVAL_S = 1
-
-class WorkerSignals(QObject):
-    connection_status = pyqtSignal(bool, str)
-    ping_response = pyqtSignal()
-
-class TelemetryReceiver(threading.Thread):
-    def __init__(self, conn_manager):
-        super().__init__()
-        self.signals = WorkerSignals()
-        self.conn_manager = conn_manager
-        self.running = True
-
-    def run(self):
-        buffer = ""
-        while self.running:
-            sock = self.conn_manager.get_socket()
-            if sock:
-                try:
-                    data = sock.recv(1024)
-                    if not data:
-                        self.conn_manager.disconnect()
-                        continue
-                    
-                    buffer += data.decode('utf-8')
-                    while '\n' in buffer:
-                        message, buffer = buffer.split('\n', 1)
-                        if message.strip() == "ACK":
-                            self.signals.ping_response.emit()
-                except (socket.error, OSError):
-                    self.conn_manager.disconnect()
-            else:
-                time.sleep(1)
-
-    def stop(self):
-        self.running = False
-
-class ConnectionManager(threading.Thread):
-    def __init__(self):
-        super().__init__()
-        self.signals = WorkerSignals()
-        self.sock = None
-        self.lock = threading.Lock()
-        self.running = True
-
-    def run(self):
-        print("Starting connection manager...")
-        address_idx = 0
-        while self.running:
-            with self.lock:
-                if self.sock is None:
-                    address_str = ROBOT_ADDRESSES[address_idx]
-                    host, port_str = address_str.split(':')
-                    port = int(port_str)
-                    
-                    print(f"Trying to connect to: {host}:{port}")
-                    try:
-                        new_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                        new_sock.settimeout(1.0)
-                        new_sock.connect((host, port))
-                        new_sock.settimeout(None)
-                        self.sock = new_sock
-                        print(f"✅ Connected to {address_str}")
-                        self.signals.connection_status.emit(True, address_str)
-                    except (socket.error, OSError) as e:
-                        print(f"🔌 Connection to {address_str} failed: {e}")
-                        self.signals.connection_status.emit(False, "")
-                        address_idx = (address_idx + 1) % len(ROBOT_ADDRESSES)
-            time.sleep(0.2)
-
-    def get_socket(self):
-        with self.lock:
-            return self.sock
-
-    def disconnect(self):
-        with self.lock:
-            if self.sock:
-                self.sock.close()
-                self.sock = None
-                self.signals.connection_status.emit(False, "")
-    
-    def stop(self):
-        self.running = False
-        self.disconnect()
     
 class AppWindow(QMainWindow):
     def __init__(self):
@@ -106,11 +18,11 @@ class AppWindow(QMainWindow):
         self.joystick = None
         self.init_pygame_and_joystick()
 
-        self.conn_manager = ConnectionManager()
+        self.conn_manager = comm.ConnectionManager()
         self.conn_manager.signals.connection_status.connect(self.update_connection_status)
         self.conn_manager.start()
 
-        self.telemetry_receiver = TelemetryReceiver(self.conn_manager)
+        self.telemetry_receiver = comm.TelemetryReceiver(self.conn_manager)
         self.telemetry_receiver.signals.ping_response.connect(self.handle_ping_response)
         self.telemetry_receiver.start()
         

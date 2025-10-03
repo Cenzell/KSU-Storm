@@ -2,6 +2,7 @@ import socket
 import threading
 import time
 
+
 HEARTBEAT_TIME = 0.5
 last_heartbeat = time.time()
 heartbeat_lock = threading.Lock()
