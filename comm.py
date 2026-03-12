@@ -13,6 +13,7 @@ from PyQt6.QtCore import QObject, pyqtSignal
 ROBOT_ADDRESSES = [
     "10.42.0.85",
     "127.0.0.1",
+    "10.222.255.253"
 ]
 COMMAND_PORT = 5555
 TELEMETRY_PORT = 5556

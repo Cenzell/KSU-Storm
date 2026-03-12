@@ -15,7 +15,9 @@ logger = logging.getLogger(__name__)
 COMMAND_PORT = 5555
 TELEMETRY_PORT = 5556
 TELEMETRY_RATE_HZ = 10
-HEARTBEAT_TIMEOUT_S = 0.75
+# Must be greater than driver ping interval (comm.py PING_INTERVAL_S=1s),
+# otherwise idle teleop will flap between lost/restored each second.
+HEARTBEAT_TIMEOUT_S = 2.5
 WATCHDOG_CHECK_INTERVAL_S = 0.1
 
 # Global state
@@ -130,7 +132,7 @@ class RobotServer:
         global robot_mode
         
         cmd_type = command.get('type')
-        #update_heartbeat()
+        update_heartbeat()
         
         try:
             if cmd_type == 'ping':
