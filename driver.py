@@ -2,11 +2,14 @@ import os
 import sys
 import time
 import logging
+import math
 import pygame
 from PyQt6.QtWidgets import QApplication, QMainWindow
-from PyQt6.QtCore import QTimer
+from PyQt6.QtCore import QTimer, Qt
+from PyQt6.QtGui import QIcon
 from PyQt6 import uic
 import comm
+from driver_ui import DriverUIHelpers
 
 # Configure logging
 logging.basicConfig(
@@ -18,12 +21,16 @@ logger = logging.getLogger(__name__)
 # Constants
 GAMEPAD_POLL_RATE_MS = 20
 JOYSTICK_THRESHOLD = 0.01  # Minimum change to send update
+MAX_LINEAR_SPEED_MPS = 1.2
+MAX_ANGULAR_SPEED_DPS = 180.0
+EXPECTED_POSE_HORIZON_S = 0.35
 
-    
-class AppWindow(QMainWindow):
+
+class AppWindow(DriverUIHelpers, QMainWindow):
     def __init__(self):
         super().__init__()
         uic.loadUi("driver_station.ui", self)
+        self.setup_tabs()
 
         self.joystick = None
         self.init_pygame_and_joystick()
@@ -59,6 +66,19 @@ class AppWindow(QMainWindow):
         self.joystick_values = {'lx': 0.0, 'ly': 0.0, 'rx': 0.0, 'ry': 0.0}
         self.last_sent_joystick_values = self.joystick_values.copy()
         self.current_mode = "STOPPED"
+        self.current_pose = {"x": 0.0, "y": 0.0, "theta_deg": 0.0}
+        self.expected_pose = self.current_pose.copy()
+
+        # Add field view to odometry panel
+        self.setup_field_view()
+        self.setup_main_camera_view()
+        self.setup_camera_stream()
+        self.current_pose = {
+            "x": self.field_widget.field_width_m / 2.0,
+            "y": self.field_widget.field_height_m / 2.0,
+            "theta_deg": 0.0
+        }
+        self.expected_pose = self.current_pose.copy()
         
         # Keyboard control state
         self.keyboard_enabled = True
@@ -69,6 +89,14 @@ class AppWindow(QMainWindow):
         self.btn_auto.clicked.connect(self.set_auto_mode)
         self.btn_teleop.clicked.connect(self.set_teleop_mode)
         self.btn_rst.clicked.connect(self.reset_robot)
+        if hasattr(self, 'pushButton'):
+            self.pushButton.clicked.connect(self.reset_odometry)
+        if hasattr(self, 'btn_odo_optical'):
+            self.btn_odo_optical.clicked.connect(lambda: self.set_odometry_mode("OPTICAL"))
+        if hasattr(self, 'btn_odo_motor'):
+            self.btn_odo_motor.clicked.connect(lambda: self.set_odometry_mode("MOTOR"))
+        if hasattr(self, 'btn_odo_hybrid'):
+            self.btn_odo_hybrid.clicked.connect(lambda: self.set_odometry_mode("HYBRID"))
         
         # Setup keyboard speed slider if it exists in UI
         if hasattr(self, 'keyboard_speed_slider'):
@@ -80,6 +108,73 @@ class AppWindow(QMainWindow):
         
         logger.info("Driver station initialized")
         logger.info("Keyboard controls: WASD=move, QE=rotate, Shift=speed boost, Space=stop")
+
+    def update_odometry_labels(self, x_m, y_m, theta_deg):
+        if hasattr(self, 'label_3'):
+            self.label_3.setText(f"X: {x_m:.2f} m")
+        if hasattr(self, 'label_2'):
+            self.label_2.setText(f"Y: {y_m:.2f} m")
+        if hasattr(self, 'label_4'):
+            self.label_4.setText(f"Theta: {theta_deg:.1f} deg")
+
+    def update_expected_pose(self):
+        """Project a short-horizon expected pose from current command inputs."""
+        base_x = float(self.current_pose["x"])
+        base_y = float(self.current_pose["y"])
+        base_theta_deg = float(self.current_pose["theta_deg"])
+
+        if self.current_mode != "TELEOP":
+            self.expected_pose = {"x": base_x, "y": base_y, "theta_deg": base_theta_deg}
+            self.field_widget.set_expected_pose(base_x, base_y, base_theta_deg)
+            return
+
+        lx = float(self.joystick_values.get("lx", 0.0))
+        ly = float(self.joystick_values.get("ly", 0.0))
+        rx = float(self.joystick_values.get("rx", 0.0))
+
+        v_forward = ly * MAX_LINEAR_SPEED_MPS
+        v_strafe = lx * MAX_LINEAR_SPEED_MPS
+        omega_deg = rx * MAX_ANGULAR_SPEED_DPS
+
+        theta_rad = math.radians(base_theta_deg)
+        v_field_x = (v_forward * math.cos(theta_rad)) - (v_strafe * math.sin(theta_rad))
+        v_field_y = (v_forward * math.sin(theta_rad)) + (v_strafe * math.cos(theta_rad))
+
+        expected_x = base_x + (v_field_x * EXPECTED_POSE_HORIZON_S)
+        expected_y = base_y + (v_field_y * EXPECTED_POSE_HORIZON_S)
+        expected_theta_deg = (base_theta_deg + (omega_deg * EXPECTED_POSE_HORIZON_S)) % 360.0
+
+        expected_x = max(0.0, min(self.field_widget.field_width_m, expected_x))
+        expected_y = max(0.0, min(self.field_widget.field_height_m, expected_y))
+
+        self.expected_pose = {"x": expected_x, "y": expected_y, "theta_deg": expected_theta_deg}
+        self.field_widget.set_expected_pose(expected_x, expected_y, expected_theta_deg)
+
+    def set_odometry_mode(self, mode):
+        """Set the odometry source mode on the robot."""
+        client = self.conn_manager.get_client()
+        if client:
+            response = client.send_command('odometry_mode', mode=mode)
+            if response and response.get('status') == 'success':
+                if hasattr(self, 'label_odo_mode'):
+                    self.label_odo_mode.setText(f"Odometry Mode: {mode.title()}")
+            else:
+                logger.warning(f"Failed to set odometry mode: {mode}")
+
+    def reset_odometry(self):
+        """Reset odometry pose on robot and local field widget."""
+        client = self.conn_manager.get_client()
+        if client:
+            response = client.send_command('reset_odometry')
+            if response and response.get('status') == 'success':
+                logger.info("Odometry reset requested")
+        center_x = self.field_widget.field_width_m / 2.0
+        center_y = self.field_widget.field_height_m / 2.0
+        self.current_pose = {"x": center_x, "y": center_y, "theta_deg": 0.0}
+        self.expected_pose = self.current_pose.copy()
+        self.field_widget.set_pose(center_x, center_y, 0.0)
+        self.field_widget.set_expected_pose(center_x, center_y, 0.0)
+        self.update_odometry_labels(center_x, center_y, 0.0)
     
     def set_auto_mode(self):
         """Switch robot to autonomous mode."""
@@ -192,6 +287,28 @@ class AppWindow(QMainWindow):
         """Handle telemetry data from robot."""
         # Update UI with telemetry data
         # Example: battery, sensor readings, motor status, etc.
+        try:
+            field = data.get('field', {})
+            pose = data.get('pose', {})
+            odometry_mode = data.get('odometry_mode')
+
+            width_m = float(field.get('width_m', self.field_widget.field_width_m))
+            height_m = float(field.get('height_m', self.field_widget.field_height_m))
+            x_m = float(pose.get('x', self.current_pose["x"]))
+            y_m = float(pose.get('y', self.current_pose["y"]))
+            theta_deg = float(pose.get('theta_deg', self.current_pose["theta_deg"]))
+
+            self.field_widget.set_field_size(width_m, height_m)
+            self.field_widget.set_pose(x_m, y_m, theta_deg)
+            self.update_odometry_labels(x_m, y_m, theta_deg)
+            self.current_pose = {"x": x_m, "y": y_m, "theta_deg": theta_deg}
+            self.update_expected_pose()
+
+            if odometry_mode and hasattr(self, 'label_odo_mode'):
+                self.label_odo_mode.setText(f"Odometry Mode: {str(odometry_mode).title()}")
+        except Exception as e:
+            logger.error(f"Error parsing telemetry pose: {e}")
+
         logger.debug(f"Telemetry: {data}")
     
     def update_keyboard_speed(self, value):
@@ -214,9 +331,7 @@ class AppWindow(QMainWindow):
         # Don't process if auto-repeat
         if event.isAutoRepeat():
             return
-        
-        from PyQt6.QtCore import Qt
-        
+
         # Log key presses for debugging
         key_names = {
             Qt.Key.Key_W: "W", Qt.Key.Key_A: "A", 
@@ -244,8 +359,6 @@ class AppWindow(QMainWindow):
     
     def calculate_keyboard_input(self):
         """Calculate joystick values from keyboard input."""
-        from PyQt6.QtCore import Qt
-        
         lx = 0.0  # Left/right strafe
         ly = 0.0  # Forward/backward
         rx = 0.0  # Rotation
@@ -396,6 +509,7 @@ class AppWindow(QMainWindow):
             self.ly_label.setText(f"LY: {self.joystick_values['ly']:.2f}")
             self.rx_label.setText(f"RX: {self.joystick_values['rx']:.2f}")
             self.ry_label.setText(f"RY: {self.joystick_values['ry']:.2f}")
+            self.update_expected_pose()
 
             # Send joystick values if changed significantly
             if self.values_changed_significantly(self.last_sent_joystick_values, self.joystick_values):
@@ -415,6 +529,8 @@ class AppWindow(QMainWindow):
         logger.info("Closing application...")
         
         try:
+            self.stop_camera_stream()
+
             # Stop threads
             self.telemetry_receiver.stop()
             self.conn_manager.stop()
@@ -438,7 +554,12 @@ class AppWindow(QMainWindow):
 def main():
     os.system('cls' if os.name == 'nt' else 'clear')
     app = QApplication(sys.argv)
+    icon_path = os.path.join(os.path.dirname(__file__), "app_icon.png")
+    if os.path.exists(icon_path):
+        app.setWindowIcon(QIcon(icon_path))
     window = AppWindow()
+    if os.path.exists(icon_path):
+        window.setWindowIcon(QIcon(icon_path))
     window.show()
     sys.exit(app.exec())
 

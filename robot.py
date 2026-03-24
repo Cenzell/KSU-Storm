@@ -3,6 +3,7 @@ import zmq
 import time
 import threading
 import logging
+import math
 
 # Configure logging
 logging.basicConfig(
@@ -19,6 +20,11 @@ TELEMETRY_RATE_HZ = 10
 # otherwise idle teleop will flap between lost/restored each second.
 HEARTBEAT_TIMEOUT_S = 2.5
 WATCHDOG_CHECK_INTERVAL_S = 0.1
+MAX_LINEAR_SPEED_MPS = 1.2
+MAX_ANGULAR_SPEED_DPS = 180.0
+FIELD_WIDTH_M = 3.6
+FIELD_HEIGHT_M = 3.6
+ENABLE_CAMERA_BROADCAST = os.environ.get("KSU_ENABLE_CAMERA_BROADCAST", "1").strip().lower() not in ("0", "false", "no")
 
 # Global state
 last_heartbeat = time.time()
@@ -114,10 +120,26 @@ class RobotServer:
         self.telemetry_socket.bind(f"tcp://*:{TELEMETRY_PORT}")
         
         self.running = True
+        self.camera_thread = None
+        self.pose_x_m = FIELD_WIDTH_M / 2.0
+        self.pose_y_m = FIELD_HEIGHT_M / 2.0
+        self.pose_theta_deg = 0.0
+        self.last_pose_update = time.time()
+        self.odometry_mode = "PRE_START"
         self.telemetry_data = {
             'battery': 12.5,
             'mode': robot_mode,
+            'odometry_mode': self.odometry_mode,
             'motor_speeds': [0.0, 0.0, 0.0, 0.0],
+            'field': {
+                'width_m': FIELD_WIDTH_M,
+                'height_m': FIELD_HEIGHT_M
+            },
+            'pose': {
+                'x': self.pose_x_m,
+                'y': self.pose_y_m,
+                'theta_deg': self.pose_theta_deg
+            },
             'sensors': {
                 'ultrasonic': 0,
                 'ir': 0,
@@ -126,6 +148,58 @@ class RobotServer:
         }
         
         logger.info(f"Robot server initialized on ports {COMMAND_PORT}/{TELEMETRY_PORT}")
+
+    def start_camera_broadcast(self):
+        """Start MJPEG camera broadcast in a background thread."""
+        if not ENABLE_CAMERA_BROADCAST:
+            logger.info("Camera broadcast disabled via KSU_ENABLE_CAMERA_BROADCAST")
+            return
+
+        try:
+            import camera as camera_module
+        except Exception as e:
+            logger.warning(f"Camera module unavailable: {e}")
+            return
+
+        def run_camera_server():
+            try:
+                camera_module.main()
+            except Exception as e:
+                logger.error(f"Camera broadcast stopped: {e}")
+
+        self.camera_thread = threading.Thread(target=run_camera_server, daemon=True, name="camera-broadcast")
+        self.camera_thread.start()
+        stream_port = getattr(camera_module, "PORT", 8080)
+        logger.info(f"Camera broadcast started on port {stream_port}")
+
+    def _integrate_pose(self, lx, ly, rx):
+        """Simple dead-reckoning from joystick commands."""
+        now = time.time()
+        dt = max(0.0, min(0.2, now - self.last_pose_update))
+        self.last_pose_update = now
+        if dt <= 0:
+            return
+
+        # Robot-frame velocities from joystick commands.
+        v_forward = ly * MAX_LINEAR_SPEED_MPS
+        v_strafe = lx * MAX_LINEAR_SPEED_MPS
+        omega_deg = rx * MAX_ANGULAR_SPEED_DPS
+
+        theta_rad = math.radians(self.pose_theta_deg)
+        # Convert robot-frame velocities to field-frame velocities.
+        v_field_x = (v_forward * math.cos(theta_rad)) - (v_strafe * math.sin(theta_rad))
+        v_field_y = (v_forward * math.sin(theta_rad)) + (v_strafe * math.cos(theta_rad))
+
+        self.pose_x_m = max(0.0, min(FIELD_WIDTH_M, self.pose_x_m + (v_field_x * dt)))
+        self.pose_y_m = max(0.0, min(FIELD_HEIGHT_M, self.pose_y_m + (v_field_y * dt)))
+        self.pose_theta_deg = (self.pose_theta_deg + (omega_deg * dt)) % 360.0
+
+    def _reset_pose(self):
+        """Reset pose to center field facing +X."""
+        self.pose_x_m = FIELD_WIDTH_M / 2.0
+        self.pose_y_m = FIELD_HEIGHT_M / 2.0
+        self.pose_theta_deg = 0.0
+        self.last_pose_update = time.time()
     
     def handle_command(self, command):
         """Process incoming command"""
@@ -148,6 +222,7 @@ class RobotServer:
                 motor_speeds = calculate_motor_speeds(joystick_data)
                 
                 if robot_mode == "TELEOP":
+                    self._integrate_pose(lx, ly, rx)
                     set_motor_speeds(motor_speeds)
                     self.telemetry_data['motor_speeds'] = motor_speeds
                     logger.debug(f"Motors: {motor_speeds}")
@@ -181,10 +256,24 @@ class RobotServer:
             elif cmd_type == 'reset':
                 robot_mode = "STOPPED"
                 set_motor_speeds([0.0, 0.0, 0.0, 0.0])
+                self._reset_pose()
                 self.telemetry_data['mode'] = robot_mode
                 self.telemetry_data['motor_speeds'] = [0.0, 0.0, 0.0, 0.0]
                 logger.info("Robot reset")
                 return {'status': 'success'}
+
+            elif cmd_type == 'reset_odometry':
+                self._reset_pose()
+                logger.info("Odometry reset")
+                return {'status': 'success'}
+
+            elif cmd_type == 'odometry_mode':
+                mode = str(command.get('mode', 'PRE_START')).upper()
+                if mode in ["OPTICAL", "MOTOR", "HYBRID", "PRE_START"]:
+                    self.odometry_mode = mode
+                    self.telemetry_data['odometry_mode'] = self.odometry_mode
+                    return {'status': 'success', 'odometry_mode': self.odometry_mode}
+                return {'status': 'error', 'message': f'Invalid odometry mode: {mode}'}
             
             else:
                 logger.warning(f"Unknown command: {cmd_type}")
@@ -225,6 +314,12 @@ class RobotServer:
                 
                 self.telemetry_data['timestamp'] = time.time()
                 self.telemetry_data['mode'] = robot_mode
+                self.telemetry_data['odometry_mode'] = self.odometry_mode
+                self.telemetry_data['pose'] = {
+                    'x': self.pose_x_m,
+                    'y': self.pose_y_m,
+                    'theta_deg': self.pose_theta_deg
+                }
                 
                 self.telemetry_socket.send_json(self.telemetry_data)
                 time.sleep(1.0 / TELEMETRY_RATE_HZ)
@@ -234,6 +329,8 @@ class RobotServer:
     
     def start(self):
         """Start server threads"""
+        self.start_camera_broadcast()
+
         # Start watchdog
         watchdog = threading.Thread(target=watchdog_thread, daemon=True)
         watchdog.start()
