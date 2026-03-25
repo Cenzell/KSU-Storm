@@ -5,6 +5,11 @@ import threading
 import logging
 import math
 
+try:
+    from hardware import PwmMotor
+except Exception:
+    PwmMotor = None
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -26,11 +31,67 @@ FIELD_WIDTH_M = 3.6
 FIELD_HEIGHT_M = 3.6
 ENABLE_CAMERA_BROADCAST = os.environ.get("KSU_ENABLE_CAMERA_BROADCAST", "1").strip().lower() not in ("0", "false", "no")
 
+# MDD10A mapping (speed order in this code is [FL, FR, RL, RR]):
+# Board 1 M1: PWM=12 DIR=5
+# Board 1 M2: PWM=13 DIR=6
+# Board 2 M1: PWM=18 DIR=16
+# Board 2 M2: PWM=19 DIR=20
+MOTOR_PIN_MAP = (
+    (12, 5),   # Front Left
+    (13, 6),   # Front Right
+    (18, 16),  # Rear Left
+    (19, 20),  # Rear Right
+)
+MOTOR_DIRECTION_MULTIPLIER = (1.0, 1.0, 1.0, 1.0)
+
 # Global state
 last_heartbeat = time.time()
 heartbeat_lock = threading.Lock()
 connection_lost = False
 robot_mode = "STOPPED"  # STOPPED, AUTO, TELEOP
+motor_controller = None
+
+
+class MotorController:
+    """Drive controller for 4 PWM+DIR channels (2x MDD10A)."""
+    def __init__(self):
+        self.available = PwmMotor is not None
+        self.motors = []
+        self.lock = threading.Lock()
+
+        if not self.available:
+            logger.warning("Motor hardware unavailable (hardware.py / gpiozero import failed). Running in simulation mode.")
+            return
+
+        for pwm_pin, dir_pin in MOTOR_PIN_MAP:
+            self.motors.append(PwmMotor(pwm_pin, dir_pin, True))
+        logger.info("Motor controller initialized for 2x MDD10A")
+
+    @staticmethod
+    def _clamp(value):
+        return max(-1.0, min(1.0, float(value)))
+
+    def set_speeds(self, speeds):
+        if not self.available:
+            return
+
+        if len(speeds) != 4:
+            raise ValueError("Expected 4 motor speeds [FL, FR, RL, RR]")
+
+        with self.lock:
+            for i, speed in enumerate(speeds):
+                command = self._clamp(speed) * float(MOTOR_DIRECTION_MULTIPLIER[i])
+                self.motors[i].set_speed(command)
+
+    def stop(self):
+        self.set_speeds([0.0, 0.0, 0.0, 0.0])
+
+
+def ensure_motor_controller():
+    global motor_controller
+    if motor_controller is None:
+        motor_controller = MotorController()
+    return motor_controller
 
 
 class JoystickData:
@@ -91,9 +152,12 @@ def calculate_motor_speeds(data: JoystickData) -> list:
 
 
 def set_motor_speeds(speeds: list):
-    """Set the motor speeds (placeholder for actual motor control)."""
-    # TODO: Implement actual motor control
-    pass
+    """Set motor speeds in order [FL, FR, RL, RR], each in [-1.0, 1.0]."""
+    controller = ensure_motor_controller()
+    try:
+        controller.set_speeds(speeds)
+    except Exception as e:
+        logger.error(f"Failed to set motor speeds: {e}")
 
 
 def update_heartbeat():
@@ -349,6 +413,10 @@ class RobotServer:
     def cleanup(self):
         """Clean up resources"""
         self.running = False
+        try:
+            ensure_motor_controller().stop()
+        except Exception as e:
+            logger.error(f"Failed to stop motors during cleanup: {e}")
         self.command_socket.close()
         self.telemetry_socket.close()
         self.context.term()

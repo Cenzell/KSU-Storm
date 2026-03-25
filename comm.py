@@ -12,6 +12,7 @@ from PyQt6.QtCore import QObject, pyqtSignal
 # Configuration
 ROBOT_ADDRESSES = [
     "10.42.0.85",
+    "10.42.0.3",
     "10.42.0.2",
     "127.0.0.1",
     "10.222.255.253"

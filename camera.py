@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import json
 import math
 import os
 import socketserver
@@ -7,6 +8,7 @@ import time
 from http import server
 
 import cv2
+import numpy as np
 
 try:
     from picamera2 import Picamera2
@@ -24,7 +26,7 @@ except ImportError:
 # =========================
 
 # Physical tag size: 2 inches = 0.0508 meters
-TAG_SIZE_METERS = 0.0508
+TAG_SIZE_METERS = 0.0492125
 
 # Camera resolution for detection/streaming
 WIDTH = 640
@@ -35,6 +37,8 @@ FX = 700.0
 FY = 700.0
 CX = WIDTH / 2.0
 CY = HEIGHT / 2.0
+CALIBRATION_FILE = os.environ.get("KSU_CAMERA_CALIBRATION_FILE", "camera_calibration.json").strip()
+ENABLE_UNDISTORT = os.environ.get("KSU_ENABLE_UNDISTORT", "1").strip().lower() not in ("0", "false", "no")
 
 # MJPEG server port
 PORT = int(os.environ.get("KSU_CAMERA_PORT", "8080"))
@@ -149,6 +153,49 @@ def create_frame_source():
     return backend, capture_rgb_frame, close_source
 
 
+def load_calibration(path):
+    """Load camera intrinsics/distortion from JSON calibration output."""
+    if not path or not os.path.exists(path):
+        return None
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        matrix = data.get("camera_matrix")
+        if not matrix:
+            print(f"Calibration file missing camera_matrix: {path}")
+            return None
+
+        dist = data.get("dist_coeffs", [])
+        image_size = data.get("image_size")
+
+        camera_matrix = np.array(matrix, dtype=np.float64)
+        dist_coeffs = np.array(dist, dtype=np.float64) if dist else None
+
+        fx = float(camera_matrix[0][0])
+        fy = float(camera_matrix[1][1])
+        cx = float(camera_matrix[0][2])
+        cy = float(camera_matrix[1][2])
+
+        print(f"Loaded calibration from {path}")
+        if image_size:
+            print(f"Calibration image size: {image_size}")
+
+        return {
+            "fx": fx,
+            "fy": fy,
+            "cx": cx,
+            "cy": cy,
+            "camera_matrix": camera_matrix,
+            "dist_coeffs": dist_coeffs,
+            "image_size": image_size,
+        }
+    except Exception as e:
+        print(f"Failed to load calibration file {path}: {e}")
+        return None
+
+
 # =========================
 # AprilTag / camera thread
 # =========================
@@ -196,6 +243,13 @@ def camera_worker():
     if backend == "opencv":
         print(f"OpenCV source: {OPENCV_CAMERA_SOURCE}")
 
+    calibration = load_calibration(CALIBRATION_FILE)
+    if calibration:
+        camera_params = [calibration["fx"], calibration["fy"], calibration["cx"], calibration["cy"]]
+    else:
+        camera_params = [FX, FY, CX, CY]
+        print("Using fallback intrinsics from camera.py constants")
+
     last_print_time = 0.0
 
     try:
@@ -205,12 +259,16 @@ def camera_worker():
                 time.sleep(0.01)
                 continue
 
+            if calibration and calibration["dist_coeffs"] is not None and ENABLE_UNDISTORT:
+                # Improve AprilTag pose quality by removing lens distortion.
+                frame = cv2.undistort(frame, calibration["camera_matrix"], calibration["dist_coeffs"])
+
             if detector is not None:
                 gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
                 results = detector.detect(
                     gray,
                     estimate_tag_pose=True,
-                    camera_params=[FX, FY, CX, CY],
+                    camera_params=camera_params,
                     tag_size=TAG_SIZE_METERS,
                 )
 
