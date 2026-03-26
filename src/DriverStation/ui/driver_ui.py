@@ -13,7 +13,7 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-CAMERA_STREAM_URL = os.environ.get("KSU_CAMERA_STREAM_URL", "http://127.0.0.1:8080/stream.mjpg")
+CAMERA_STREAM_URL = os.environ.get("KSU_CAMERA_STREAM_URL", "http://10.42.0.3:8080/stream.mjpg")
 CAMERA_RECONNECT_MS = 1500
 
 
@@ -84,7 +84,7 @@ class FieldWidget(QWidget):
         painter.setBrush(QBrush(QColor(230, 120, 40)))
         painter.drawEllipse(center, robot_radius_px, robot_radius_px)
 
-        heading_rad = self.robot_theta_deg * 3.141592653589793 / 180.0
+        heading_rad = math.radians(self.robot_theta_deg)
         arrow_len = robot_radius_px * 2.2
         tip = QPointF(
             center.x() + arrow_len * math.cos(heading_rad),
@@ -108,7 +108,7 @@ class FieldWidget(QWidget):
         painter.setBrush(QBrush(QColor(60, 180, 200, 80)))
         painter.drawEllipse(expected_center, robot_radius_px * 0.8, robot_radius_px * 0.8)
 
-        expected_heading_rad = self.expected_theta_deg * 3.141592653589793 / 180.0
+        expected_heading_rad = math.radians(self.expected_theta_deg)
         expected_tip = QPointF(
             expected_center.x() + arrow_len * 0.8 * math.cos(expected_heading_rad),
             expected_center.y() - arrow_len * 0.8 * math.sin(expected_heading_rad),

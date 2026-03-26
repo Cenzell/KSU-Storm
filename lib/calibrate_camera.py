@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+from __future__ import annotations
+
 import argparse
 import json
 import os
@@ -13,13 +15,13 @@ except ImportError:
     Picamera2 = None
 
 
-def parse_source(raw):
+def parse_source(raw: str):
     if raw.isdigit() or (raw.startswith("-") and raw[1:].isdigit()):
         return int(raw)
     return raw
 
 
-def create_capture(backend, source, width, height):
+def create_capture(backend: str, source: str, width: int, height: int):
     backend = backend.lower().strip()
     if backend == "auto":
         backend = "picamera2" if Picamera2 is not None else "opencv"
@@ -64,7 +66,7 @@ def create_capture(backend, source, width, height):
     return "opencv", read_frame_bgr, close
 
 
-def compute_reprojection_error(objpoints, imgpoints, rvecs, tvecs, mtx, dist):
+def compute_reprojection_error(objpoints, imgpoints, rvecs, tvecs, mtx, dist) -> float:
     total_error = 0.0
     total_points = 0
 

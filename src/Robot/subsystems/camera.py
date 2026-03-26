@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+from __future__ import annotations
+
 import json
 import math
 import os
@@ -6,6 +8,7 @@ import socketserver
 import threading
 import time
 from http import server
+from typing import Any, Dict, Optional, Tuple, Union
 
 import cv2
 import numpy as np
@@ -91,14 +94,14 @@ output = StreamingOutput()
 # Camera helpers
 # =========================
 
-def parse_opencv_source(raw):
+def parse_opencv_source(raw: str) -> Union[int, str]:
     # Numeric value means device index, otherwise treat as URL/path.
     if raw.isdigit() or (raw.startswith("-") and raw[1:].isdigit()):
         return int(raw)
     return raw
 
 
-def resolve_camera_backend():
+def resolve_camera_backend() -> str:
     if CAMERA_BACKEND == "picamera2":
         return "picamera2"
     if CAMERA_BACKEND == "opencv":
@@ -108,52 +111,68 @@ def resolve_camera_backend():
 
 
 def create_frame_source():
+    def create_opencv_source():
+        source = parse_opencv_source(OPENCV_CAMERA_SOURCE)
+        cap = cv2.VideoCapture(source)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, WIDTH)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, HEIGHT)
+
+        if not cap.isOpened():
+            raise RuntimeError(f"Could not open OpenCV camera source: {source}")
+
+        def capture_rgb_frame():
+            ok, frame_bgr = cap.read()
+            if not ok:
+                return None
+            return cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+
+        def close_source():
+            cap.release()
+
+        return "opencv", capture_rgb_frame, close_source
+
     backend = resolve_camera_backend()
 
     if backend == "picamera2":
         if Picamera2 is None:
+            if CAMERA_BACKEND == "auto":
+                print("Picamera2 unavailable, falling back to OpenCV camera source")
+                return create_opencv_source()
             raise RuntimeError("Picamera2 is not installed but KSU_CAMERA_BACKEND=picamera2")
 
-        picam2 = Picamera2()
-        config = picam2.create_video_configuration(
-            main={"size": (WIDTH, HEIGHT), "format": "RGB888"}
-        )
-        picam2.configure(config)
-        picam2.start()
-        time.sleep(1.0)
+        try:
+            camera_info = Picamera2.global_camera_info()
+            if not camera_info:
+                raise RuntimeError("No Picamera2 cameras detected")
 
-        def capture_rgb_frame():
-            return picam2.capture_array()  # Already RGB
+            picam2 = Picamera2()
+            config = picam2.create_video_configuration(
+                main={"size": (WIDTH, HEIGHT), "format": "RGB888"}
+            )
+            picam2.configure(config)
+            picam2.start()
+            time.sleep(1.0)
 
-        def close_source():
-            try:
-                picam2.stop()
-            except Exception:
-                pass
+            def capture_rgb_frame():
+                return picam2.capture_array()  # Already RGB
 
-        return backend, capture_rgb_frame, close_source
+            def close_source():
+                try:
+                    picam2.stop()
+                except Exception:
+                    pass
 
-    source = parse_opencv_source(OPENCV_CAMERA_SOURCE)
-    cap = cv2.VideoCapture(source)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, WIDTH)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, HEIGHT)
+            return backend, capture_rgb_frame, close_source
+        except Exception as e:
+            if CAMERA_BACKEND == "auto":
+                print(f"Picamera2 init failed ({e}); falling back to OpenCV source {OPENCV_CAMERA_SOURCE}")
+                return create_opencv_source()
+            raise
 
-    if not cap.isOpened():
-        raise RuntimeError(f"Could not open OpenCV camera source: {source}")
-
-    def capture_rgb_frame():
-        ok, frame_bgr = cap.read()
-        if not ok:
-            return None
-        return cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-
-    def close_source():
-        cap.release()
-
-    return backend, capture_rgb_frame, close_source
+    return create_opencv_source()
 
 
-def load_calibration(path):
+def load_calibration(path: str) -> Optional[Dict[str, Any]]:
     """Load camera intrinsics/distortion from JSON calibration output."""
     if not path or not os.path.exists(path):
         return None
@@ -200,7 +219,7 @@ def load_calibration(path):
 # AprilTag / camera thread
 # =========================
 
-def rotation_matrix_to_euler_zyx(R):
+def rotation_matrix_to_euler_zyx(R: Any) -> Tuple[float, float, float]:
     """
     Returns yaw, pitch, roll in degrees using ZYX convention.
     yaw   = rotation about Z
@@ -238,10 +257,16 @@ def camera_worker():
                 debug=DEBUG,
             )
 
-    backend, capture_rgb_frame, close_source = create_frame_source()
-    print(f"Camera backend: {backend}")
-    if backend == "opencv":
-        print(f"OpenCV source: {OPENCV_CAMERA_SOURCE}")
+    while True:
+        try:
+            backend, capture_rgb_frame, close_source = create_frame_source()
+            print(f"Camera backend: {backend}")
+            if backend == "opencv":
+                print(f"OpenCV source: {OPENCV_CAMERA_SOURCE}")
+            break
+        except Exception as e:
+            print(f"Camera source init failed: {e}. Retrying in 2s...")
+            time.sleep(2.0)
 
     calibration = load_calibration(CALIBRATION_FILE)
     if calibration:
@@ -384,6 +409,8 @@ class StreamingHandler(server.BaseHTTPRequestHandler):
                     with output.condition:
                         output.condition.wait()
                         frame = output.frame
+                    if frame is None:
+                        continue
 
                     self.wfile.write(b"--FRAME\r\n")
                     self.send_header("Content-Type", "image/jpeg")

@@ -1,4 +1,4 @@
-# Form implementation generated from reading ui file '/home/cenzell/PythonProjects/KSU-Storm/driver_station.ui'
+# Form implementation generated from reading ui file '/home/cenzell/PythonProjects/KSU-Storm/src/DriverStation/ui/driver_station.ui'
 #
 # Created by: PyQt6 UI code generator 6.10.2
 #

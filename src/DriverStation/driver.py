@@ -3,11 +3,24 @@ import sys
 import time
 import logging
 import math
+from pathlib import Path
 import pygame
 from PyQt6.QtWidgets import QApplication, QMainWindow
 from PyQt6.QtCore import QTimer, Qt
 from PyQt6.QtGui import QIcon
 from PyQt6 import uic
+
+BASE_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = BASE_DIR.parents[1]
+LIB_DIR = PROJECT_ROOT / "lib"
+UI_DIR = BASE_DIR / "ui"
+UI_FILE = UI_DIR / "driver_station.ui"
+
+for path in (LIB_DIR, UI_DIR):
+    path_str = str(path)
+    if path_str not in sys.path:
+        sys.path.insert(0, path_str)
+
 import comm
 from driver_ui import DriverUIHelpers
 
@@ -24,12 +37,21 @@ JOYSTICK_THRESHOLD = 0.01  # Minimum change to send update
 MAX_LINEAR_SPEED_MPS = 1.2
 MAX_ANGULAR_SPEED_DPS = 180.0
 EXPECTED_POSE_HORIZON_S = 0.35
+SLOW_DRIVE_SCALE = 0.2
+AXIS_DEADZONE = 0.03
+
+FACE_BUTTON_COLORS = {
+    0: "green",   # A
+    1: "red",     # B
+    2: "blue",    # X
+    3: "purple",  # Y
+}
 
 
 class AppWindow(DriverUIHelpers, QMainWindow):
     def __init__(self):
         super().__init__()
-        uic.loadUi("driver_station.ui", self)
+        uic.loadUi(str(UI_FILE), self)
         self.setup_tabs()
 
         self.joystick = None
@@ -178,21 +200,13 @@ class AppWindow(DriverUIHelpers, QMainWindow):
     
     def set_auto_mode(self):
         """Switch robot to autonomous mode."""
-        client = self.conn_manager.get_client()
-        if client:
-            client.set_mode("AUTO")
-            self.current_mode = "AUTO"
-            self.robot_status.setText("Autonomous")
+        if self._set_robot_mode("AUTO"):
             self.start_match_timer()
             logger.info("Switched to AUTO mode")
     
     def set_teleop_mode(self):
         """Switch robot to teleoperated mode (manual start)."""
-        client = self.conn_manager.get_client()
-        if client:
-            client.set_mode("TELEOP")
-            self.current_mode = "TELEOP"
-            self.robot_status.setText("Teleoperated")
+        if self._set_robot_mode("TELEOP"):
             # Reset timer when manually starting teleop
             self.match_time_seconds = 0
             if not self.match_running:
@@ -201,11 +215,7 @@ class AppWindow(DriverUIHelpers, QMainWindow):
     
     def auto_switch_to_teleop(self):
         """Automatically switch from AUTO to TELEOP after 30 seconds."""
-        client = self.conn_manager.get_client()
-        if client:
-            client.set_mode("TELEOP")
-            self.current_mode = "TELEOP"
-            self.robot_status.setText("Teleoperated")
+        if self._set_robot_mode("TELEOP"):
             # Reset timer for teleop phase
             self.match_time_seconds = 0
             logger.info("Auto-switched from AUTO to TELEOP at 30 seconds")
@@ -219,6 +229,56 @@ class AppWindow(DriverUIHelpers, QMainWindow):
             self.robot_status.setText("Stopped")
             self.stop_match_timer()
             logger.info("Robot reset")
+
+    def _set_robot_mode(self, mode):
+        mode = str(mode).upper()
+        client = self.conn_manager.get_client()
+        if not client:
+            return False
+
+        response = client.set_mode(mode)
+        if not response or response.get("status") != "success":
+            logger.warning(f"Failed to set mode: {mode}")
+            return False
+
+        self.current_mode = mode
+        if mode == "AUTO":
+            self.robot_status.setText("Autonomous")
+        elif mode == "TELEOP":
+            self.robot_status.setText("Teleoperated")
+        else:
+            self.robot_status.setText("Stopped")
+        return True
+
+    def _set_control_mode_label(self, mode_name, color=None):
+        if not hasattr(self, "control_mode_label"):
+            return
+        if color is None:
+            self.control_mode_label.setText(f"Control: {mode_name}")
+        else:
+            self.control_mode_label.setText(f"Control: <b style='color: {color};'>{mode_name}</b>")
+
+    def _set_face_button_style(self, button_index, active):
+        labels = {
+            0: self.button_a_label,
+            1: self.button_b_label,
+            2: self.button_x_label,
+            3: self.button_y_label,
+        }
+        label = labels.get(button_index)
+        if label is None:
+            return
+        label.setStyleSheet(f"color: {FACE_BUTTON_COLORS[button_index] if active else 'lightgray'}")
+
+    def _scaled_axes(self, lx, ly, rx, ry):
+        if self.slow_drive.isChecked():
+            return (
+                lx * SLOW_DRIVE_SCALE,
+                ly * SLOW_DRIVE_SCALE,
+                rx * SLOW_DRIVE_SCALE,
+                ry * SLOW_DRIVE_SCALE,
+            )
+        return lx, ly, rx, ry
     
     def start_match_timer(self):
         """Start the match timer."""
@@ -369,7 +429,7 @@ class AppWindow(DriverUIHelpers, QMainWindow):
             speed = 1.0  # Full speed with shift
 
         if self.slow_drive.isChecked():
-            speed *= 0.2
+            speed *= SLOW_DRIVE_SCALE
         
         # Movement keys
         if Qt.Key.Key_W in self.keys_pressed:
@@ -449,14 +509,11 @@ class AppWindow(DriverUIHelpers, QMainWindow):
             
             # Update control mode indicator
             if has_keyboard_input:
-                if hasattr(self, 'control_mode_label'):
-                    self.control_mode_label.setText("Control: <b style='color: blue;'>Keyboard</b>")
+                self._set_control_mode_label("Keyboard", color="blue")
             elif self.joystick is not None:
-                if hasattr(self, 'control_mode_label'):
-                    self.control_mode_label.setText("Control: <b style='color: green;'>Gamepad</b>")
+                self._set_control_mode_label("Gamepad", color="green")
             else:
-                if hasattr(self, 'control_mode_label'):
-                    self.control_mode_label.setText("Control: None")
+                self._set_control_mode_label("None")
             
             # Use keyboard input if active, otherwise use joystick
             if has_keyboard_input:
@@ -467,42 +524,42 @@ class AppWindow(DriverUIHelpers, QMainWindow):
             elif self.joystick is not None:
                 # Poll joystick only if no keyboard input
                 pygame.event.pump()
-                deadzone = 0.03
-                
                 # Read and apply deadzone to joystick axes
-                self.joystick_values['lx'] = self.joystick.get_axis(0) if abs(self.joystick.get_axis(0)) > deadzone else 0.0
-                self.joystick_values['ly'] = -self.joystick.get_axis(1) if abs(self.joystick.get_axis(1)) > deadzone else 0.0
-                self.joystick_values['rx'] = self.joystick.get_axis(2) if abs(self.joystick.get_axis(2)) > deadzone else 0.0
-                self.joystick_values['ry'] = -self.joystick.get_axis(4) if abs(self.joystick.get_axis(4)) > deadzone else 0.0
+                axis_lx = self.joystick.get_axis(0)
+                axis_ly = self.joystick.get_axis(1)
+                axis_rx = self.joystick.get_axis(2)
+                axis_ry = self.joystick.get_axis(4)
+
+                self.joystick_values['lx'] = axis_lx if abs(axis_lx) > AXIS_DEADZONE else 0.0
+                self.joystick_values['ly'] = -axis_ly if abs(axis_ly) > AXIS_DEADZONE else 0.0
+                self.joystick_values['rx'] = axis_rx if abs(axis_rx) > AXIS_DEADZONE else 0.0
+                self.joystick_values['ry'] = -axis_ry if abs(axis_ry) > AXIS_DEADZONE else 0.0
 
                 # Handle button events
                 for event in pygame.event.get():
                     if event.type == pygame.JOYBUTTONDOWN:
                         client.send_button(event.button, "DOWN")
-                        if event.button == 0: 
-                            self.button_a_label.setStyleSheet("color: green")
-                        elif event.button == 1: 
-                            self.button_b_label.setStyleSheet("color: red")
-                        elif event.button == 2: 
-                            self.button_x_label.setStyleSheet("color: blue")
-                        elif event.button == 3: 
-                            self.button_y_label.setStyleSheet("color: purple")
+                        if event.button in FACE_BUTTON_COLORS:
+                            self._set_face_button_style(event.button, active=True)
                             
                     elif event.type == pygame.JOYBUTTONUP:
                         client.send_button(event.button, "UP")
-                        if event.button in [0, 1, 2, 3]:
-                            label = [self.button_a_label, self.button_b_label, 
-                                    self.button_x_label, self.button_y_label][event.button]
-                            label.setStyleSheet("color: lightgray")
+                        if event.button in FACE_BUTTON_COLORS:
+                            self._set_face_button_style(event.button, active=False)
             else:
                 # No input - zero everything
                 self.joystick_values = {'lx': 0.0, 'ly': 0.0, 'rx': 0.0, 'ry': 0.0}
 
-            if self.slow_drive.isChecked():
-                self.joystick_values['lx'] *= 0.2
-                self.joystick_values['ly'] *= 0.2
-                self.joystick_values['rx'] *= 0.2
-                self.joystick_values['ry'] *= 0.2
+            lx, ly, rx, ry = self._scaled_axes(
+                self.joystick_values['lx'],
+                self.joystick_values['ly'],
+                self.joystick_values['rx'],
+                self.joystick_values['ry'],
+            )
+            self.joystick_values['lx'] = lx
+            self.joystick_values['ly'] = ly
+            self.joystick_values['rx'] = rx
+            self.joystick_values['ry'] = ry
 
             # Update UI labels
             self.lx_label.setText(f"LX: {self.joystick_values['lx']:.2f}")
