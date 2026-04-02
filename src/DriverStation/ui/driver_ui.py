@@ -1,6 +1,8 @@
 import os
 import math
 import logging
+import urllib.request
+import numpy as np
 
 from PyQt6.QtWidgets import QWidget, QVBoxLayout, QTabWidget, QLabel
 from PyQt6.QtCore import Qt, QPointF, QRectF, QThread, pyqtSignal
@@ -138,25 +140,46 @@ class CameraStreamThread(QThread):
 
         while self._running:
             self.status_changed.emit(f"Connecting: {self.stream_url}")
-            capture = cv2.VideoCapture(self.stream_url)
-            if not capture.isOpened():
+
+            try:
+                stream = urllib.request.urlopen(self.stream_url, timeout=5)
+                self.status_changed.emit("Camera connected")
+                buffer = b""
+
+                while self._running:
+                    chunk = stream.read(4096)
+                    if not chunk:
+                        self.status_changed.emit("Camera stream dropped (reconnecting...)")
+                        break
+
+                    buffer += chunk
+
+                    start = buffer.find(b"\xff\xd8")
+                    end = buffer.find(b"\xff\xd9")
+
+                    if start != -1 and end != -1 and end > start:
+                        jpg = buffer[start:end + 2]
+                        buffer = buffer[end + 2:]
+
+                        arr = np.frombuffer(jpg, dtype=np.uint8)
+                        frame_bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+                        if frame_bgr is None:
+                            continue
+
+                        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+                        h, w, c = frame_rgb.shape
+                        image = QImage(
+                            frame_rgb.data,
+                            w,
+                            h,
+                            c * w,
+                            QImage.Format.Format_RGB888
+                        ).copy()
+                        self.frame_ready.emit(image)
+
+            except Exception:
                 self.status_changed.emit("Camera disconnected (retrying...)")
-                self.msleep(CAMERA_RECONNECT_MS)
-                continue
 
-            self.status_changed.emit("Camera connected")
-            while self._running:
-                ok, frame_bgr = capture.read()
-                if not ok:
-                    self.status_changed.emit("Camera stream dropped (reconnecting...)")
-                    break
-
-                frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-                h, w, c = frame_rgb.shape
-                image = QImage(frame_rgb.data, w, h, c * w, QImage.Format.Format_RGB888).copy()
-                self.frame_ready.emit(image)
-
-            capture.release()
             if self._running:
                 self.msleep(CAMERA_RECONNECT_MS)
 

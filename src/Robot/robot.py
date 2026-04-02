@@ -6,6 +6,19 @@ import time
 from dataclasses import dataclass
 from typing import Any, Dict, List
 
+from pathlib import Path
+import sys
+
+BASE_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = BASE_DIR.parents[1]
+LIB_DIR = PROJECT_ROOT / "lib"
+
+lib_str = str(LIB_DIR)
+if lib_str not in sys.path:
+    sys.path.insert(0, lib_str)
+
+from serial_bridge import SerialBridge
+
 import zmq
 
 try:
@@ -143,34 +156,29 @@ class JoystickData:
         self.rx = _clamp_unit(self.rx)
         self.ry = _clamp_unit(self.ry)
 
-
-def all_stop() -> None:
-    """Emergency stop - called when connection is lost."""
+def watchdog_thread(server: "RobotServer") -> None:
+    """Monitor heartbeat and trigger emergency stop if connection is lost."""
     global connection_lost
-    if not connection_lost:
-        logger.warning("!!!! CONNECTION LOST - EMERGENCY STOP !!!!")
-        connection_lost = True
-        set_motor_speeds(ZERO_MOTOR_SPEEDS)
 
-
-def watchdog_thread() -> None:
-    """Monitor heartbeat and trigger emergency stop if connection lost."""
-    global connection_lost
     logger.info("Watchdog thread started")
-    
-    while True:
-        with heartbeat_lock:
-            time_since_heartbeat = time.time() - last_heartbeat
-            
-            if time_since_heartbeat > HEARTBEAT_TIMEOUT_S:
-                if not connection_lost:
-                    all_stop()
-            elif connection_lost:
-                logger.info("Connection restored")
-                connection_lost = False
-                
-        time.sleep(WATCHDOG_CHECK_INTERVAL_S)
 
+    while server.running:
+        try:
+            with heartbeat_lock:
+                time_since_heartbeat = time.time() - last_heartbeat
+
+                if time_since_heartbeat > HEARTBEAT_TIMEOUT_S:
+                    if not connection_lost:
+                        server.all_stop()
+                elif connection_lost:
+                    logger.info("Connection restored")
+                    connection_lost = False
+
+            time.sleep(WATCHDOG_CHECK_INTERVAL_S)
+
+        except Exception as e:
+            logger.error(f"Watchdog error: {e}")
+            time.sleep(WATCHDOG_CHECK_INTERVAL_S)
 
 def calculate_motor_speeds(data: JoystickData) -> List[float]:
     """
@@ -234,48 +242,92 @@ class RobotServer:
     """ZMQ-based robot server"""
     def __init__(self):
         self.context = zmq.Context()
-        
+    
         # REP socket for commands
         self.command_socket = self.context.socket(zmq.REP)
         self.command_socket.bind(f"tcp://*:{COMMAND_PORT}")
-        
+    
         # PUB socket for telemetry
         self.telemetry_socket = self.context.socket(zmq.PUB)
         self.telemetry_socket.bind(f"tcp://*:{TELEMETRY_PORT}")
-        
+    
         self.running = True
         self.camera_thread = None
+        self.bridge = None
+    
         self.pose_x_m = FIELD_WIDTH_M / 2.0
         self.pose_y_m = FIELD_HEIGHT_M / 2.0
         self.pose_theta_deg = 0.0
         self.last_pose_update = time.time()
         self.odometry_mode = "PRE_START"
+    
         self.telemetry_data: Dict[str, Any] = {
-            'battery': 12.5,
-            'mode': robot_mode,
-            'odometry_mode': self.odometry_mode,
-            'motor_speeds': ZERO_MOTOR_SPEEDS.copy(),
-            'field': {
-                'width_m': FIELD_WIDTH_M,
-                'height_m': FIELD_HEIGHT_M
+            "battery": 12.5,
+            "mode": robot_mode,
+            "odometry_mode": self.odometry_mode,
+            "motor_speeds": ZERO_MOTOR_SPEEDS.copy(),
+            "field": {
+                "width_m": FIELD_WIDTH_M,
+                "height_m": FIELD_HEIGHT_M,
             },
-            'pose': {
-                'x': self.pose_x_m,
-                'y': self.pose_y_m,
-                'theta_deg': self.pose_theta_deg
+            "pose": {
+                "x": self.pose_x_m,
+                "y": self.pose_y_m,
+                "theta_deg": self.pose_theta_deg,
             },
-            'sensors': {
-                'ultrasonic': 0,
-                'ir': 0,
-                'gyro': 0.0
-            }
+            "sensors": {
+                "ultrasonic": 0,
+                "ir": 0,
+                "gyro": 0.0,
+            },
+            "encoders": [],
+            "relay": 0,
+            "mcu": {
+                "bridge_connected": False,
+            },
         }
-        
+    
+        try:
+            self.bridge = SerialBridge(
+                port=os.environ.get("KSU_MCU_PORT", "/dev/ttyACM0"),
+                baudrate=int(os.environ.get("KSU_MCU_BAUD", "115200")),
+            )
+            self.bridge.connect()
+            logger.info("MCU serial bridge connected")
+        except Exception as e:
+            logger.warning("MCU bridge not available: %s", e)
+            self.bridge = None
+    
         logger.info(f"Robot server initialized on ports {COMMAND_PORT}/{TELEMETRY_PORT}")
 
+    def all_stop(self) -> None:
+        """Emergency stop for both MCU-backed and local motor control paths."""
+        global connection_lost, robot_mode
+    
+        if not connection_lost:
+            logger.warning("!!!! CONNECTION LOST - EMERGENCY STOP !!!!")
+    
+        connection_lost = True
+        robot_mode = "STOPPED"
+        self._stop_drive()
+        self.telemetry_data["mode"] = robot_mode
+
     def _stop_drive(self) -> None:
-        set_motor_speeds(ZERO_MOTOR_SPEEDS)
-        self.telemetry_data["motor_speeds"] = ZERO_MOTOR_SPEEDS.copy()
+        """Stop all drivetrain/mechanism outputs."""
+        zero_drive = [0.0, 0.0, 0.0, 0.0]
+
+        if self.bridge:
+            drive_ok = self.bridge.set_drive_motors(zero_drive)
+            mech_ok = self.bridge.set_mech_motors([0.0, 0.0, 0.0])
+
+            if not drive_ok:
+                logger.warning("Failed to send zero drive command to MCU")
+            if not mech_ok:
+                logger.warning("Failed to send zero mechanism command to MCU")
+        else:
+            set_motor_speeds(zero_drive)
+
+        self.telemetry_data["motor_speeds"] = zero_drive.copy()
 
     def start_camera_broadcast(self):
         """Start MJPEG camera broadcast in a background thread."""
@@ -284,7 +336,10 @@ class RobotServer:
             return
 
         try:
-            import camera as camera_module
+            try:
+                import subsystems.camera as camera_module
+            except Exception:
+                from .subsystems import camera as camera_module
         except Exception as e:
             logger.warning(f"Camera module unavailable: {e}")
             return
@@ -345,80 +400,113 @@ class RobotServer:
         }
 
     def handle_command(self, command: Dict[str, Any]) -> Dict[str, Any]:
-        """Process incoming command"""
+        """Process incoming command."""
         global robot_mode
-        
-        cmd_type = command.get('type')
+
+        cmd_type = str(command.get("type", "")).strip().lower()
         update_heartbeat()
-        
+
         try:
-            if cmd_type == 'ping':
-                return {'status': 'success', 'timestamp': time.time()}
-            
-            elif cmd_type == 'joystick':
+            if cmd_type == "ping":
+                if self.bridge:
+                    try:
+                        self.bridge.send({"type": "ping"})
+                    except Exception as e:
+                        logger.debug(f"MCU ping send failed: {e}")
+
+                return {"status": "success", "timestamp": time.time()}
+
+            elif cmd_type == "joystick":
                 joystick_data = self._read_drive_inputs(command)
-                motor_speeds = calculate_motor_speeds(joystick_data)
-                
-                if robot_mode == "TELEOP":
+
+                if robot_mode == "TELEOP" and not connection_lost:
+                    motor_speeds = calculate_motor_speeds(joystick_data)
                     self._integrate_pose(joystick_data.lx, joystick_data.ly, joystick_data.rx)
-                    set_motor_speeds(motor_speeds)
-                    self.telemetry_data['motor_speeds'] = motor_speeds
+
+                    if self.bridge:
+                        ok = self.bridge.set_drive_motors(motor_speeds)
+                        if not ok:
+                            return {
+                                "status": "error",
+                                "message": "Failed to send drive command to MCU",
+                            }
+                    else:
+                        set_motor_speeds(motor_speeds)
+
+                    self.telemetry_data["motor_speeds"] = motor_speeds
                     logger.debug(f"Motors: {motor_speeds}")
-                
-                return {'status': 'success'}
-            
-            elif cmd_type == 'button':
-                button_id = command.get('button_id')
-                action = command.get('action')
+
+                return {"status": "success"}
+
+            elif cmd_type == "button":
+                button_id = command.get("button_id")
+                action = command.get("action")
                 logger.info(f"Button {button_id} {action}")
-                
-                # TODO: Handle button actions
-                
-                return {'status': 'success'}
-            
-            elif cmd_type == 'mode':
-                new_mode = command.get('mode', 'STOPPED').upper()
-                
-                if new_mode in VALID_ROBOT_MODES:
-                    robot_mode = new_mode
-                    self.telemetry_data['mode'] = robot_mode
-                    logger.info(f"Mode changed to: {robot_mode}")
-                    
-                    if robot_mode == "STOPPED":
-                        self._stop_drive()
-                    
-                    return {'status': 'success', 'mode': robot_mode}
-                else:
-                    return {'status': 'error', 'message': f'Invalid mode: {new_mode}'}
-            
-            elif cmd_type == 'reset':
+
+                # TODO: map buttons to bridge actions here if needed.
+                return {"status": "success"}
+
+            elif cmd_type == "mode":
+                new_mode = str(command.get("mode", "STOPPED")).upper()
+
+                if new_mode not in VALID_ROBOT_MODES:
+                    return {"status": "error", "message": f"Invalid mode: {new_mode}"}
+
+                robot_mode = new_mode
+                self.telemetry_data["mode"] = robot_mode
+                logger.info(f"Mode changed to: {robot_mode}")
+
+                if self.bridge:
+                    ok = self.bridge.set_mode(robot_mode)
+                    if not ok:
+                        logger.warning("Failed to forward mode to MCU: %s", robot_mode)
+
+                if robot_mode == "STOPPED":
+                    self._stop_drive()
+
+                return {"status": "success", "mode": robot_mode}
+
+            elif cmd_type == "reset":
                 robot_mode = "STOPPED"
+                self.telemetry_data["mode"] = robot_mode
+
                 self._stop_drive()
                 self._reset_pose()
-                self.telemetry_data['mode'] = robot_mode
-                logger.info("Robot reset")
-                return {'status': 'success'}
 
-            elif cmd_type == 'reset_odometry':
+                if self.bridge:
+                    ok = self.bridge.reset()
+                    if not ok:
+                        logger.warning("Failed to send reset command to MCU")
+
+                    mode_ok = self.bridge.set_mode(robot_mode)
+                    if not mode_ok:
+                        logger.warning("Failed to send STOPPED mode to MCU after reset")
+
+                logger.info("Robot reset")
+                return {"status": "success"}
+
+            elif cmd_type == "reset_odometry":
                 self._reset_pose()
                 logger.info("Odometry reset")
-                return {'status': 'success'}
+                return {"status": "success"}
 
-            elif cmd_type == 'odometry_mode':
-                mode = str(command.get('mode', 'PRE_START')).upper()
-                if mode in VALID_ODOMETRY_MODES:
-                    self.odometry_mode = mode
-                    self.telemetry_data['odometry_mode'] = self.odometry_mode
-                    return {'status': 'success', 'odometry_mode': self.odometry_mode}
-                return {'status': 'error', 'message': f'Invalid odometry mode: {mode}'}
-            
+            elif cmd_type == "odometry_mode":
+                mode = str(command.get("mode", "PRE_START")).upper()
+
+                if mode not in VALID_ODOMETRY_MODES:
+                    return {"status": "error", "message": f"Invalid odometry mode: {mode}"}
+
+                self.odometry_mode = mode
+                self.telemetry_data["odometry_mode"] = self.odometry_mode
+                return {"status": "success", "odometry_mode": self.odometry_mode}
+
             else:
                 logger.warning(f"Unknown command: {cmd_type}")
-                return {'status': 'error', 'message': f'Unknown command: {cmd_type}'}
-                
+                return {"status": "error", "message": f"Unknown command: {cmd_type}"}
+
         except Exception as e:
             logger.error(f"Error handling command: {e}")
-            return {'status': 'error', 'message': str(e)}
+            return {"status": "error", "message": str(e)}
     
     def command_loop(self) -> None:
         """Handle incoming commands"""
@@ -440,55 +528,98 @@ class RobotServer:
                     pass
     
     def telemetry_loop(self) -> None:
-        """Broadcast telemetry"""
+        """Broadcast telemetry."""
         logger.info("Telemetry broadcaster ready")
-        
+
         while self.running:
             try:
-                # TODO: Update with real sensor data
-                # self.telemetry_data['battery'] = read_battery()
-                # self.telemetry_data['sensors']['ultrasonic'] = read_ultrasonic()
-                
-                self.telemetry_data['timestamp'] = time.time()
-                self.telemetry_data['mode'] = robot_mode
-                self.telemetry_data['odometry_mode'] = self.odometry_mode
+                self.telemetry_data["timestamp"] = time.time()
+                self.telemetry_data["mode"] = robot_mode
+                self.telemetry_data["odometry_mode"] = self.odometry_mode
+
                 self._update_telemetry_pose()
-                
+
+                if self.bridge:
+                    try:
+                        mcu = self.bridge.get_latest_telemetry()
+                    except Exception as e:
+                        logger.error(f"Failed to read MCU telemetry: {e}")
+                        mcu = {"bridge_connected": False}
+
+                    self.telemetry_data["mcu"] = mcu
+                    self.telemetry_data["encoders"] = mcu.get("encoders", [])
+                    self.telemetry_data["relay"] = mcu.get("relay", 0)
+                else:
+                    self.telemetry_data["mcu"] = {"bridge_connected": False}
+                    self.telemetry_data["encoders"] = []
+                    self.telemetry_data["relay"] = 0
+
                 self.telemetry_socket.send_json(self.telemetry_data)
                 time.sleep(1.0 / TELEMETRY_RATE_HZ)
-                
+
             except Exception as e:
                 logger.error(f"Telemetry error: {e}")
-    
+                time.sleep(1.0 / TELEMETRY_RATE_HZ)
+
     def start(self) -> None:
-        """Start server threads"""
+        """Start server threads."""
         self.start_camera_broadcast()
 
-        # Start watchdog
-        watchdog = threading.Thread(target=watchdog_thread, daemon=True)
+        watchdog = threading.Thread(
+            target=watchdog_thread,
+            args=(self,),
+            daemon=True,
+            name="watchdog",
+        )
         watchdog.start()
-        
-        # Start telemetry
-        telemetry_thread = threading.Thread(target=self.telemetry_loop, daemon=True)
+
+        telemetry_thread = threading.Thread(
+            target=self.telemetry_loop,
+            daemon=True,
+            name="telemetry",
+        )
         telemetry_thread.start()
-        
-        # Run command handler in main thread
+
         try:
             self.command_loop()
         except KeyboardInterrupt:
             logger.info("Server shutdown requested")
             self.running = False
-    
+
     def cleanup(self) -> None:
-        """Clean up resources"""
+        """Clean up resources."""
         self.running = False
+
+        try:
+            self._stop_drive()
+        except Exception as e:
+            logger.error(f"Failed to stop outputs during cleanup: {e}")
+
+        if self.bridge:
+            try:
+                self.bridge.close()
+            except Exception as e:
+                logger.error(f"Failed to close MCU bridge: {e}")
+
         try:
             ensure_motor_controller().stop()
         except Exception as e:
-            logger.error(f"Failed to stop motors during cleanup: {e}")
-        self.command_socket.close()
-        self.telemetry_socket.close()
-        self.context.term()
+            logger.debug(f"Local motor cleanup skipped/failed: {e}")
+
+        try:
+            self.command_socket.close(0)
+        except Exception:
+            pass
+
+        try:
+            self.telemetry_socket.close(0)
+        except Exception:
+            pass
+
+        try:
+            self.context.term()
+        except Exception:
+            pass
 
 
 def main():

@@ -50,7 +50,8 @@ PORT = int(os.environ.get("KSU_CAMERA_PORT", "8080"))
 #   auto      -> Picamera2 when available, otherwise OpenCV VideoCapture
 #   picamera2 -> force RPi camera path
 #   opencv    -> force OpenCV camera path
-CAMERA_BACKEND = os.environ.get("KSU_CAMERA_BACKEND", "auto").strip().lower()
+# Default to OpenCV to avoid libcamera/Picamera2 dependency unless explicitly enabled.
+CAMERA_BACKEND = os.environ.get("KSU_CAMERA_BACKEND", "opencv").strip().lower()
 
 # OpenCV camera source (device index or URL), used for laptop/dev and as fallback.
 # Examples:

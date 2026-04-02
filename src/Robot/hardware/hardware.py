@@ -24,7 +24,7 @@ def _is_truthy_env(var_name: str, default: str = "0") -> bool:
     return os.environ.get(var_name, default).strip().lower() not in ("0", "false", "no", "off")
 
 
-PWM_BACKEND = os.environ.get("KSU_PWM_BACKEND", "pi").strip().lower()
+PWM_BACKEND = os.environ.get("KSU_PWM_BACKEND", "pca").strip().lower()
 USE_PCA9685 = PWM_BACKEND in ("pca", "pca9685")
 PCA9685_ADDRESS = int(os.environ.get("KSU_PCA9685_ADDRESS", "0x40"), 0)
 PCA9685_FREQUENCY_HZ = int(os.environ.get("KSU_PCA9685_FREQUENCY_HZ", "1000"))

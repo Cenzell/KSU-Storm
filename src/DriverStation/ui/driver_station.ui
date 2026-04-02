@@ -280,17 +280,7 @@
         <rect>
          <x>265</x>
          <y>120</y>
-         <width>471</width>
-         <height>311</height>
-        </rect>
-       </property>
-      </widget>
-      <widget class="QWidget" name="main_camera_placeholder" native="true">
-       <property name="geometry">
-        <rect>
-         <x>740</x>
-         <y>120</y>
-         <width>141</width>
+         <width>621</width>
          <height>311</height>
         </rect>
        </property>
@@ -510,7 +500,7 @@
         <item row="6" column="0">
          <widget class="QCheckBox" name="checkBox">
           <property name="text">
-           <string>Enable FMS Check</string>
+           <string>DIY Testing FMS</string>
           </property>
          </widget>
         </item>

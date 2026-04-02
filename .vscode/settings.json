@@ -1,5 +1,6 @@
 {
     "idf.pythonInstallPath": "/usr/bin/python",
+    "python.defaultInterpreterPath": "${workspaceFolder}/venv/bin/python",
     "python.analysis.extraPaths": [
         "./src/DriverStation/ui"
     ]
