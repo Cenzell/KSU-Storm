@@ -1,0 +1,23 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>ksu_storm</name>
+  <version>0.1.0</version>
+  <description>Initial ROS 2 Jazzy port for the KSU Storm robot runtime.</description>
+  <maintainer email="cenzell@example.com">cenzell</maintainer>
+  <license>Proprietary</license>
+
+  <buildtool_depend>ament_python</buildtool_depend>
+
+  <depend>diagnostic_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>launch</depend>
+  <depend>launch_ros</depend>
+  <depend>nav_msgs</depend>
+  <depend>rclpy</depend>
+  <depend>std_msgs</depend>
+  <depend>std_srvs</depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
