@@ -39,6 +39,7 @@ class RobotClient:
         self.robot_ip = robot_ip
         self.context = zmq.Context()
         self.signals = WorkerSignals()
+        self.command_lock = threading.Lock()
 
         self.command_socket = self.context.socket(zmq.REQ)
         self.command_socket.connect(f"tcp://{robot_ip}:{COMMAND_PORT}")
@@ -68,8 +69,9 @@ class RobotClient:
         """Send a command to the robot and wait for a response."""
         try:
             command = {"type": command_type, "timestamp": time.time(), **kwargs}
-            self.command_socket.send_json(command)
-            response = self.command_socket.recv_json()
+            with self.command_lock:
+                self.command_socket.send_json(command)
+                response = self.command_socket.recv_json()
 
             self._set_connected(True)
             return response

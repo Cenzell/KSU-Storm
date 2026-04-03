@@ -3,8 +3,7 @@ import math
 import logging
 import threading
 import time
-from dataclasses import dataclass
-from typing import Any, Dict, List
+from typing import Any, Dict
 
 from pathlib import Path
 import sys
@@ -20,11 +19,30 @@ if lib_str not in sys.path:
 from serial_bridge import SerialBridge
 
 import zmq
-
-try:
-    from hardware import PwmMotor
-except Exception:
-    PwmMotor = None
+from constants import (
+    COMMAND_PORT,
+    ENABLE_CAMERA_BROADCAST,
+    FIELD_HEIGHT_M,
+    FIELD_WIDTH_M,
+    HEARTBEAT_TIMEOUT_S,
+    JOYSTICK_Y_SIGN,
+    MAX_ANGULAR_SPEED_DPS,
+    MAX_LINEAR_SPEED_MPS,
+    ROBOT_FOOTPRINT_SIZE_M,
+    TELEMETRY_PORT,
+    TELEMETRY_RATE_HZ,
+    VALID_ALLIANCES,
+    VALID_ODOMETRY_MODES,
+    VALID_ROBOT_MODES,
+    WATCHDOG_CHECK_INTERVAL_S,
+    ZERO_MOTOR_SPEEDS,
+)
+from subsystems.drive import (
+    JoystickData,
+    calculate_motor_speeds,
+    ensure_motor_controller,
+    set_motor_speeds,
+)
 
 # Configure logging
 logging.basicConfig(
@@ -33,146 +51,38 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Constants
-COMMAND_PORT = 5555
-TELEMETRY_PORT = 5556
-TELEMETRY_RATE_HZ = 10
-# Must be greater than driver ping interval (comm.py PING_INTERVAL_S=1s),
-# otherwise idle teleop will flap between lost/restored each second.
-HEARTBEAT_TIMEOUT_S = 2.5
-WATCHDOG_CHECK_INTERVAL_S = 0.1
-MAX_LINEAR_SPEED_MPS = 1.2
-MAX_ANGULAR_SPEED_DPS = 180.0
-FIELD_WIDTH_M = 3.6
-FIELD_HEIGHT_M = 3.6
-ENABLE_CAMERA_BROADCAST = os.environ.get("KSU_ENABLE_CAMERA_BROADCAST", "1").strip().lower() not in ("0", "false", "no")
-USE_PCA9685_PWM = os.environ.get("KSU_PWM_BACKEND", "pi").strip().lower() in ("pca", "pca9685")
-
-# Motor mapping (speed order [FL, FR, RL, RR]).
-# Each tuple is (pwm, dir). When using PCA backend, pwm is PCA channel [0..15].
-if USE_PCA9685_PWM:
-    MOTOR_PIN_MAP = (
-        (0, 5),    # Front Left  -> PCA CH0, DIR GPIO5
-        (1, 6),    # Front Right -> PCA CH1, DIR GPIO6
-        (2, 16),   # Rear Left   -> PCA CH2, DIR GPIO16
-        (3, 20),   # Rear Right  -> PCA CH3, DIR GPIO20
-    )
-else:
-    MOTOR_PIN_MAP = (
-        (12, 5),   # Front Left
-        (13, 6),   # Front Right
-        (18, 16),  # Rear Left
-        (19, 20),  # Rear Right
-    )
-# For mirrored left/right drivetrain layouts, right side is commonly inverted.
-# Order: [FL, FR, RL, RR]
-MOTOR_DIRECTION_MULTIPLIER = (
-    float(os.environ.get("KSU_MOTOR_FL_SIGN", "1.0")),
-    float(os.environ.get("KSU_MOTOR_FR_SIGN", "1.0")),
-    float(os.environ.get("KSU_MOTOR_RL_SIGN", "1.0")),
-    float(os.environ.get("KSU_MOTOR_RR_SIGN", "1.0")),
-)
-JOYSTICK_DEADBAND = 0.06
-INPUT_EXPO = 1.4
-# Most setups already map forward to positive LY in driver.py.
-# Override with KSU_JOYSTICK_Y_SIGN=1.0 if your controller is already forward-positive.
-JOYSTICK_Y_SIGN = float(os.environ.get("KSU_JOYSTICK_Y_SIGN", "-1.0"))
-
 # Global state
 last_heartbeat = time.time()
 heartbeat_lock = threading.Lock()
+heartbeat_seen = False
 connection_lost = False
 robot_mode = "STOPPED"  # STOPPED, AUTO, TELEOP
-motor_controller = None
-ZERO_MOTOR_SPEEDS = [0.0, 0.0, 0.0, 0.0]
-VALID_ROBOT_MODES = {"AUTO", "TELEOP", "STOPPED"}
-VALID_ODOMETRY_MODES = {"OPTICAL", "MOTOR", "HYBRID", "PRE_START"}
-
-
-class MotorController:
-    """Drive controller for 4 PWM+DIR channels (2x MDD10A)."""
-    def __init__(self):
-        self.available = PwmMotor is not None
-        self.motors = []
-        self.lock = threading.Lock()
-
-        if not self.available:
-            logger.warning("Motor hardware unavailable (hardware.py / gpiozero import failed). Running in simulation mode.")
-            return
-
-        for pwm_pin, dir_pin in MOTOR_PIN_MAP:
-            self.motors.append(PwmMotor(pwm_pin, dir_pin, True))
-        logger.info("Motor controller initialized for 2x MDD10A")
-        logger.info(
-            "Wheel mapping [FL, FR, RL, RR]=%s using backend=%s, signs=%s",
-            MOTOR_PIN_MAP,
-            "pca9685" if USE_PCA9685_PWM else "pi",
-            MOTOR_DIRECTION_MULTIPLIER,
-        )
-
-    @staticmethod
-    def _clamp(value: float) -> float:
-        return max(-1.0, min(1.0, float(value)))
-
-    def set_speeds(self, speeds: List[float]) -> None:
-        if not self.available:
-            return
-
-        if len(speeds) != 4:
-            raise ValueError("Expected 4 motor speeds [FL, FR, RL, RR]")
-
-        with self.lock:
-            for i, speed in enumerate(speeds):
-                command = self._clamp(speed) * float(MOTOR_DIRECTION_MULTIPLIER[i])
-                self.motors[i].set_speed(command)
-
-    def stop(self) -> None:
-        self.set_speeds(ZERO_MOTOR_SPEEDS)
-
-
-def ensure_motor_controller() -> MotorController:
-    global motor_controller
-    if motor_controller is None:
-        motor_controller = MotorController()
-    return motor_controller
-
-
-def _clamp_unit(value: float) -> float:
-    return max(-1.0, min(1.0, float(value)))
-
-
-@dataclass
-class JoystickData:
-    """Container for joystick input data."""
-
-    lx: float = 0.0
-    ly: float = 0.0
-    rx: float = 0.0
-    ry: float = 0.0
-
-    def __post_init__(self) -> None:
-        self.lx = _clamp_unit(self.lx)
-        self.ly = _clamp_unit(self.ly)
-        self.rx = _clamp_unit(self.rx)
-        self.ry = _clamp_unit(self.ry)
 
 def watchdog_thread(server: "RobotServer") -> None:
     """Monitor heartbeat and trigger emergency stop if connection is lost."""
-    global connection_lost
+    global connection_lost, heartbeat_seen
 
     logger.info("Watchdog thread started")
 
     while server.running:
         try:
+            should_sleep = False
             with heartbeat_lock:
-                time_since_heartbeat = time.time() - last_heartbeat
+                if not heartbeat_seen:
+                    should_sleep = True
+                else:
+                    time_since_heartbeat = time.time() - last_heartbeat
 
-                if time_since_heartbeat > HEARTBEAT_TIMEOUT_S:
-                    if not connection_lost:
-                        server.all_stop()
-                elif connection_lost:
-                    logger.info("Connection restored")
-                    connection_lost = False
+                    if time_since_heartbeat > HEARTBEAT_TIMEOUT_S:
+                        if not connection_lost:
+                            server.all_stop()
+                    elif connection_lost:
+                        logger.info("Connection restored")
+                        connection_lost = False
+
+            if should_sleep:
+                time.sleep(WATCHDOG_CHECK_INTERVAL_S)
+                continue
 
             time.sleep(WATCHDOG_CHECK_INTERVAL_S)
 
@@ -180,59 +90,15 @@ def watchdog_thread(server: "RobotServer") -> None:
             logger.error(f"Watchdog error: {e}")
             time.sleep(WATCHDOG_CHECK_INTERVAL_S)
 
-def calculate_motor_speeds(data: JoystickData) -> List[float]:
-    """
-    Calculate mecanum drive motor speeds from joystick input.
-    Returns: List of 4 motor speeds [FL, FR, RL, RR]
-    """
-    def apply_deadband(value, deadband):
-        value = float(value)
-        if abs(value) < deadband:
-            return 0.0
-
-        # Rescale to keep full-range response after deadband.
-        sign = 1.0 if value >= 0.0 else -1.0
-        scaled = (abs(value) - deadband) / (1.0 - deadband)
-        return sign * scaled
-
-    def shape_input(value, expo):
-        value = max(-1.0, min(1.0, float(value)))
-        sign = 1.0 if value >= 0.0 else -1.0
-        return sign * (abs(value) ** expo)
-
-    x = shape_input(apply_deadband(data.lx, JOYSTICK_DEADBAND), INPUT_EXPO)  # strafe
-    y = shape_input(apply_deadband(data.ly, JOYSTICK_DEADBAND), INPUT_EXPO)  # forward
-    z = shape_input(apply_deadband(data.rx, JOYSTICK_DEADBAND), INPUT_EXPO)  # rotate
-
-    motor1_speed = y + x + z  # Front Left
-    motor2_speed = y - x - z  # Front Right
-    motor3_speed = y - x + z  # Rear Left
-    motor4_speed = y + x - z  # Rear Right
-
-    speeds = [motor1_speed, motor2_speed, motor3_speed, motor4_speed]
-    
-    # Normalize speeds
-    max_speed = max(abs(s) for s in speeds)
-    if max_speed > 1.0:
-        speeds = [s / max_speed for s in speeds]
-
-    return speeds
-
-
-def set_motor_speeds(speeds: List[float]) -> None:
-    """Set motor speeds in order [FL, FR, RL, RR], each in [-1.0, 1.0]."""
-    controller = ensure_motor_controller()
-    try:
-        controller.set_speeds(speeds)
-    except Exception as e:
-        logger.error(f"Failed to set motor speeds: {e}")
-
 
 def update_heartbeat() -> None:
     """Update the last heartbeat timestamp."""
-    global last_heartbeat, connection_lost
+    global last_heartbeat, connection_lost, heartbeat_seen
     with heartbeat_lock:
         last_heartbeat = time.time()
+        if not heartbeat_seen:
+            heartbeat_seen = True
+            logger.info("Driver heartbeat detected; watchdog armed")
         if connection_lost:
             logger.info("Connection restored via command")
             connection_lost = False
@@ -254,10 +120,9 @@ class RobotServer:
         self.running = True
         self.camera_thread = None
         self.bridge = None
+        self.alliance = "RED"
     
-        self.pose_x_m = FIELD_WIDTH_M / 2.0
-        self.pose_y_m = FIELD_HEIGHT_M / 2.0
-        self.pose_theta_deg = 0.0
+        self.pose_x_m, self.pose_y_m, self.pose_theta_deg = self._alliance_start_pose()
         self.last_pose_update = time.time()
         self.odometry_mode = "PRE_START"
     
@@ -265,6 +130,7 @@ class RobotServer:
             "battery": 12.5,
             "mode": robot_mode,
             "odometry_mode": self.odometry_mode,
+            "alliance": self.alliance,
             "motor_speeds": ZERO_MOTOR_SPEEDS.copy(),
             "field": {
                 "width_m": FIELD_WIDTH_M,
@@ -377,11 +243,21 @@ class RobotServer:
         self.pose_y_m = max(0.0, min(FIELD_HEIGHT_M, self.pose_y_m + (v_field_y * dt)))
         self.pose_theta_deg = (self.pose_theta_deg + (omega_deg * dt)) % 360.0
 
+    def _alliance_start_pose(self) -> tuple[float, float, float]:
+        half_robot = ROBOT_FOOTPRINT_SIZE_M / 2.0
+        start_y = half_robot
+        start_theta_deg = 90.0
+
+        if self.alliance == "BLUE":
+            start_x = FIELD_WIDTH_M - half_robot
+        else:
+            start_x = half_robot
+
+        return start_x, start_y, start_theta_deg
+
     def _reset_pose(self) -> None:
-        """Reset pose to center field facing +X."""
-        self.pose_x_m = FIELD_WIDTH_M / 2.0
-        self.pose_y_m = FIELD_HEIGHT_M / 2.0
-        self.pose_theta_deg = 0.0
+        """Reset pose to the selected alliance starting corner."""
+        self.pose_x_m, self.pose_y_m, self.pose_theta_deg = self._alliance_start_pose()
         self.last_pose_update = time.time()
     
     def _read_drive_inputs(self, command: Dict[str, Any]) -> JoystickData:
@@ -398,6 +274,7 @@ class RobotServer:
             "y": self.pose_y_m,
             "theta_deg": self.pose_theta_deg,
         }
+        self.telemetry_data["alliance"] = self.alliance
 
     def handle_command(self, command: Dict[str, Any]) -> Dict[str, Any]:
         """Process incoming command."""
@@ -499,6 +376,17 @@ class RobotServer:
                 self.odometry_mode = mode
                 self.telemetry_data["odometry_mode"] = self.odometry_mode
                 return {"status": "success", "odometry_mode": self.odometry_mode}
+
+            elif cmd_type == "alliance":
+                new_alliance = str(command.get("alliance", self.alliance)).upper()
+
+                if new_alliance not in VALID_ALLIANCES:
+                    return {"status": "error", "message": f"Invalid alliance: {new_alliance}"}
+
+                self.alliance = new_alliance
+                self.telemetry_data["alliance"] = self.alliance
+                logger.info("Alliance set to: %s", self.alliance)
+                return {"status": "success", "alliance": self.alliance}
 
             else:
                 logger.warning(f"Unknown command: {cmd_type}")
