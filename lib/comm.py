@@ -11,12 +11,11 @@ from PyQt6.QtCore import QObject, pyqtSignal
 
 # Configuration
 ROBOT_ADDRESSES = [
+    "10.10.89.3",
     "10.42.0.85",
     "10.42.0.3",
     "10.42.0.2",
-    "127.0.0.1",
-    "10.91.75.23",
-    "10.222.255.253"
+    "127.0.0.1"
 ]
 COMMAND_PORT = 5555
 TELEMETRY_PORT = 5556
@@ -94,6 +93,15 @@ class RobotClient:
 
     def reset_robot(self) -> Optional[dict]:
         return self.send_command("reset")
+
+    def run_auto_routine(self, routine: dict) -> Optional[dict]:
+        return self.send_command("auto_run", routine=routine)
+
+    def cancel_auto_routine(self) -> Optional[dict]:
+        return self.send_command("auto_cancel")
+
+    def get_auto_status(self) -> Optional[dict]:
+        return self.send_command("auto_status")
 
     def send_ping(self) -> Optional[dict]:
         self.ping_sent_time = time.time()

@@ -1,6 +1,7 @@
 import os
 import math
 import logging
+import sys
 import urllib.request
 import json
 import time
@@ -8,8 +9,8 @@ from dataclasses import dataclass
 from pathlib import Path
 import numpy as np
 
-from PyQt6.QtWidgets import QWidget, QVBoxLayout, QTabWidget, QLabel, QGridLayout, QGroupBox, QPlainTextEdit, QPushButton, QHBoxLayout, QSizePolicy
-from PyQt6.QtCore import Qt, QPointF, QRectF, QThread, pyqtSignal
+from PyQt6.QtWidgets import QWidget, QVBoxLayout, QTabWidget, QLabel, QGridLayout, QGroupBox, QPlainTextEdit, QPushButton, QHBoxLayout, QSizePolicy, QSlider, QCheckBox, QComboBox
+from PyQt6.QtCore import Qt, QPointF, QRectF, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor, QPainter, QPen, QBrush, QPolygonF, QImage, QPixmap
 
 try:
@@ -21,8 +22,18 @@ logger = logging.getLogger(__name__)
 
 CAMERA_RECONNECT_MS = 1500
 DRIVERSTATION_DIR = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = DRIVERSTATION_DIR.parents[1]
 FIELD_IMAGE_PATH = DRIVERSTATION_DIR / "field.png"
 ROBOT_SIZE_M = 18.0 * 0.0254
+DEFAULT_ROBOT_ADDRESSES = [
+    "10.10.89.3",
+    "10.42.0.85",
+    "10.42.0.3",
+    "10.42.0.2",
+    "127.0.0.1",
+    "10.91.75.23",
+    "10.222.255.253",
+]
 
 
 @dataclass(frozen=True)
@@ -33,7 +44,7 @@ class CameraFeedConfig:
 
 
 def build_camera_feed_configs():
-    base_url = os.environ.get("KSU_CAMERA_BASE_URL", "http://10.42.0.3:8080").rstrip("/")
+    base_url = os.environ.get("KSU_CAMERA_BASE_URL", "http://10.10.89.3:8080").rstrip("/")
     return [
         CameraFeedConfig(
             name="front_left",
@@ -63,6 +74,20 @@ def build_camera_feed_configs():
 
 
 CAMERA_FEEDS = build_camera_feed_configs()
+
+
+def missing_opencv_message() -> str:
+    active_python = Path(sys.executable)
+    message = f"Camera unavailable: OpenCV not installed in {active_python}"
+
+    repo_venv_python = PROJECT_ROOT / "venv" / "bin" / "python"
+    if repo_venv_python.exists() and repo_venv_python != active_python:
+        return (
+            f"{message}\n"
+            f"Launch the driver station with {repo_venv_python}"
+        )
+
+    return message
 
 
 class FieldWidget(QWidget):
@@ -230,7 +255,7 @@ class CameraStreamThread(QThread):
 
     def run(self):
         if cv2 is None:
-            self.status_changed.emit(self.camera_name, "Camera unavailable: OpenCV not installed")
+            self.status_changed.emit(self.camera_name, missing_opencv_message())
             return
 
         while self._running:
@@ -319,9 +344,15 @@ class DriverUIHelpers:
 
         self.main_tabs = QTabWidget(self.centralwidget)
         self.main_tabs.setObjectName("main_tabs")
+        self._camera_latest_frames = {}
+        self._camera_status_cache = {}
+        self._camera_render_timer = QTimer(self.main_tabs)
+        self._camera_render_timer.setInterval(100)
+        self._camera_render_timer.timeout.connect(self._flush_camera_frames)
 
         self.gridLayout.removeWidget(self.frame)
-        self.gridLayout.addWidget(self.main_tabs, 1, 1, 1, 1)
+        self.gridLayout.addWidget(self.main_tabs, 0, 0)
+        self.main_tabs.setStyleSheet(self._panel_style())
         self.main_tabs.addTab(self.frame, "Main")
         self.setup_main_page_layout()
 
@@ -350,16 +381,12 @@ class DriverUIHelpers:
 
         self.main_tabs.addTab(self.camera_tab, "Camera")
 
-        for tab_name in ["Settings", "Network"]:
-            tab = QWidget()
-            tab_layout = QVBoxLayout(tab)
-            tab_layout.setContentsMargins(12, 12, 12, 12)
-            tab_layout.addWidget(QLabel(f"{tab_name} page - add controls here."))
-            tab_layout.addStretch(1)
-            self.main_tabs.addTab(tab, tab_name)
-
+        self.setup_settings_tab()
+        self.setup_network_tab()
         self.setup_odometry_tab()
         self.setup_diagnostics_tab()
+        self.main_tabs.currentChanged.connect(self._handle_tab_changed)
+        self._camera_render_timer.start()
 
     def _panel_style(self):
         return (
@@ -377,68 +404,228 @@ class DriverUIHelpers:
             "padding: 6px 10px;"
             "}"
             "QPushButton:hover { background-color: rgb(49, 70, 82); }"
+            "QComboBox {"
+            "background-color: rgb(37, 54, 64);"
+            "color: rgb(240, 245, 247);"
+            "border: 1px solid rgb(77, 122, 126);"
+            "border-radius: 8px;"
+            "padding: 6px 10px;"
+            "}"
+            "QTabWidget::pane {"
+            "border: 1px solid rgb(55, 100, 102);"
+            "background-color: rgb(14, 19, 24);"
+            "border-radius: 8px;"
+            "top: -1px;"
+            "}"
+            "QTabBar::tab {"
+            "background-color: rgb(24, 32, 40);"
+            "color: rgb(210, 220, 226);"
+            "border: 1px solid rgb(55, 100, 102);"
+            "padding: 6px 12px;"
+            "margin-right: 4px;"
+            "border-top-left-radius: 8px;"
+            "border-top-right-radius: 8px;"
+            "}"
+            "QTabBar::tab:selected {"
+            "background-color: rgb(37, 54, 64);"
+            "color: rgb(240, 245, 247);"
+            "}"
+            "QTabBar::tab:hover { background-color: rgb(44, 63, 74); }"
         )
 
     def setup_main_page_layout(self):
         self.frame.setStyleSheet("background-color: rgb(11, 16, 20);")
-        frame_connection = getattr(self, "frame_connection", None)
-        frame_robot_control = getattr(self, "frame_robot_control", None)
-        field_view_placeholder = getattr(self, "field_view_placeholder", None)
-        main_camera_placeholder = getattr(self, "main_camera_placeholder", None)
-        frame_connection_2 = getattr(self, "frame_connection_2", None)
-        frame_connection_3 = getattr(self, "frame_connection_3", None)
-        frame_keyboard = getattr(self, "frame_keyboard", None)
+        existing_layout = self.frame.layout()
+        if existing_layout is None:
+            root_layout = QGridLayout(self.frame)
+        else:
+            root_layout = existing_layout
+            while root_layout.count():
+                item = root_layout.takeAt(0)
+                widget = item.widget()
+                if widget is not None:
+                    widget.setParent(None)
+        root_layout.setContentsMargins(12, 12, 12, 12)
+        root_layout.setHorizontalSpacing(12)
+        root_layout.setVerticalSpacing(12)
 
-        panel_names = [
+        # Hide the original geometry-based containers so they do not sit on top of
+        # the rebuilt dashboard and steal mouse events.
+        legacy_panels = [
             "frame_connection",
             "frame_robot_control",
-            "field_view_placeholder",
-            "main_camera_placeholder",
             "frame_connection_2",
             "frame_connection_3",
             "frame_keyboard",
         ]
-
-        for name in panel_names:
+        for name in legacy_panels:
             panel = getattr(self, name, None)
-            if panel is None:
-                continue
-            panel.setParent(None)
-            panel.setStyleSheet(self._panel_style())
-
-        root_layout = QGridLayout(self.frame)
-        root_layout.setContentsMargins(14, 14, 14, 14)
-        root_layout.setHorizontalSpacing(14)
-        root_layout.setVerticalSpacing(14)
+            if panel is not None:
+                panel.hide()
 
         left_column = QWidget(self.frame)
         left_layout = QVBoxLayout(left_column)
         left_layout.setContentsMargins(0, 0, 0, 0)
-        left_layout.setSpacing(14)
-        if frame_connection is not None:
-            left_layout.addWidget(frame_connection)
-        if frame_connection_2 is not None:
-            left_layout.addWidget(frame_connection_2)
-        if frame_connection_3 is not None:
-            left_layout.addWidget(frame_connection_3, 1)
+        left_layout.setSpacing(12)
+
+        status_group = QGroupBox("Connection")
+        status_layout = QVBoxLayout(status_group)
+        for widget in (
+            self.status_label,
+            self.address_label,
+            self.ping_label,
+            self.gamepad_label,
+            self.control_mode_label,
+        ):
+            status_layout.addWidget(widget)
+        buttons_row = QHBoxLayout()
+        buttons_row.setSpacing(8)
+        for widget in (
+            self.button_b_label,
+            self.button_y_label,
+            self.button_a_label,
+            self.button_x_label,
+        ):
+            buttons_row.addWidget(widget)
+        status_layout.addLayout(buttons_row)
+        axes_row = QHBoxLayout()
+        axes_row.setSpacing(8)
+        for widget in (
+            self.lx_label,
+            self.rx_label,
+            self.ly_label,
+            self.ry_label,
+        ):
+            axes_row.addWidget(widget)
+        status_layout.addLayout(axes_row)
+        left_layout.addWidget(status_group)
+
+        options_group = QGroupBox("Options")
+        options_layout = QVBoxLayout(options_group)
+        for widget in (
+            self.end_after_teleop,
+            self.slow_drive,
+            self.only_drive,
+            self.disable_drive,
+            self.disable_vision,
+            self.check_odo,
+            self.checkBox,
+        ):
+            options_layout.addWidget(widget)
+        options_layout.addStretch(1)
+        left_layout.addWidget(options_group)
+
+        odometry_group = QGroupBox("Odometry Controls")
+        odometry_layout = QVBoxLayout(odometry_group)
+        odometry_layout.addWidget(self.label_odo_mode)
+        pose_row = QHBoxLayout()
+        for widget in (self.label_3, self.label_2, self.label_4):
+            pose_row.addWidget(widget)
+        odometry_layout.addLayout(pose_row)
+        mode_row = QHBoxLayout()
+        for widget in (self.btn_odo_optical, self.btn_odo_motor, self.btn_odo_hybrid):
+            mode_row.addWidget(widget)
+        odometry_layout.addLayout(mode_row)
+        odometry_layout.addWidget(self.pushButton)
+        odometry_layout.addStretch(1)
+        left_layout.addWidget(odometry_group, 1)
 
         center_column = QWidget(self.frame)
         center_layout = QVBoxLayout(center_column)
         center_layout.setContentsMargins(0, 0, 0, 0)
-        center_layout.setSpacing(14)
-        if frame_robot_control is not None:
-            center_layout.addWidget(frame_robot_control)
-        if field_view_placeholder is not None:
-            center_layout.addWidget(field_view_placeholder, 1)
+        center_layout.setSpacing(12)
+
+        control_group = QGroupBox("Robot Control")
+        control_layout = QGridLayout(control_group)
+        control_layout.addWidget(self.label, 0, 0)
+        control_layout.addWidget(self.robot_status, 0, 1)
+        control_layout.addWidget(self.timer, 0, 2)
+        control_layout.addWidget(self.btn_auto, 1, 0)
+        control_layout.addWidget(self.btn_teleop, 1, 1)
+        control_layout.addWidget(self.btn_rst, 1, 2)
+        control_layout.addWidget(self.btn_auto_2, 2, 0)
+        control_layout.addWidget(self.btn_auto_3, 2, 1, 1, 2)
+        self.auto_routine_selector = QComboBox()
+        self.auto_routine_selector.setObjectName("auto_routine_selector")
+        self.auto_run_selected_button = QPushButton("Run Selected Auto")
+        self.auto_run_selected_button.setObjectName("auto_run_selected_button")
+        self.auto_cancel_button = QPushButton("Cancel Auto")
+        self.auto_cancel_button.setObjectName("auto_cancel_button")
+        self.auto_routine_description_label = QLabel("Selected Auto: None")
+        self.auto_routine_description_label.setWordWrap(True)
+        self.auto_status_label = QLabel("Auto Status: Idle")
+        self.auto_status_detail_label = QLabel("Auto Detail: No routine running")
+        self.auto_status_detail_label.setWordWrap(True)
+        self.auto_status_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self.auto_status_detail_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        control_layout.addWidget(self.auto_routine_selector, 3, 0, 1, 2)
+        control_layout.addWidget(self.auto_run_selected_button, 3, 2)
+        control_layout.addWidget(self.auto_cancel_button, 4, 0)
+        control_layout.addWidget(self.auto_status_label, 4, 1, 1, 2)
+        control_layout.addWidget(self.auto_routine_description_label, 5, 0, 1, 3)
+        control_layout.addWidget(self.auto_status_detail_label, 6, 0, 1, 3)
+        control_layout.setColumnStretch(0, 1)
+        control_layout.setColumnStretch(1, 1)
+        control_layout.setColumnStretch(2, 1)
+        center_layout.addWidget(control_group)
+
+        field_group = QGroupBox("Field / Driver View")
+        field_layout = QVBoxLayout(field_group)
+        field_layout.setContentsMargins(10, 10, 10, 10)
+        if not hasattr(self, "main_center_tabs"):
+            self.main_center_tabs = QTabWidget()
+            self.main_center_tabs.setObjectName("main_center_tabs")
+        if not hasattr(self, "main_field_tab"):
+            self.main_field_tab = QWidget()
+        if self.main_field_tab.layout() is None:
+            self.main_field_tab_layout = QVBoxLayout(self.main_field_tab)
+            self.main_field_tab_layout.setContentsMargins(0, 0, 0, 0)
+        else:
+            self.main_field_tab_layout = self.main_field_tab.layout()
+        if self.main_field_tab_layout.indexOf(self.field_view_placeholder) == -1:
+            self.main_field_tab_layout.addWidget(self.field_view_placeholder, 1)
+
+        if not hasattr(self, "main_driver_camera_tab"):
+            self.main_driver_camera_tab = QWidget()
+        if self.main_driver_camera_tab.layout() is None:
+            self.main_driver_camera_tab_layout = QVBoxLayout(self.main_driver_camera_tab)
+            self.main_driver_camera_tab_layout.setContentsMargins(0, 0, 0, 0)
+        else:
+            self.main_driver_camera_tab_layout = self.main_driver_camera_tab.layout()
+
+        if not hasattr(self, "main_driver_camera_placeholder"):
+            self.main_driver_camera_placeholder = CameraView("Driver Camera\nWaiting for stream...")
+            self.main_driver_camera_placeholder.setMinimumSize(320, 240)
+            self.main_driver_camera_tab_layout.addWidget(self.main_driver_camera_placeholder, 1)
+
+        if self.main_center_tabs.indexOf(self.main_field_tab) == -1:
+            self.main_center_tabs.addTab(self.main_field_tab, "Field Map")
+        else:
+            self.main_center_tabs.setTabText(self.main_center_tabs.indexOf(self.main_field_tab), "Field Map")
+        if self.main_center_tabs.indexOf(self.main_driver_camera_tab) == -1:
+            self.main_center_tabs.addTab(self.main_driver_camera_tab, "Driver Camera")
+        else:
+            self.main_center_tabs.setTabText(self.main_center_tabs.indexOf(self.main_driver_camera_tab), "Driver Camera")
+        field_layout.addWidget(self.main_center_tabs, 1)
+        center_layout.addWidget(field_group, 1)
 
         right_column = QWidget(self.frame)
         right_layout = QVBoxLayout(right_column)
         right_layout.setContentsMargins(0, 0, 0, 0)
-        right_layout.setSpacing(14)
-        if main_camera_placeholder is not None:
-            right_layout.addWidget(main_camera_placeholder, 1)
-        if frame_keyboard is not None:
-            right_layout.addWidget(frame_keyboard)
+        right_layout.setSpacing(12)
+
+        if hasattr(self, "main_camera_stack_container") or hasattr(self, "main_camera_placeholder"):
+            camera_group = QGroupBox("Camera Stack")
+            camera_layout = QVBoxLayout(camera_group)
+            camera_layout.setContentsMargins(10, 10, 10, 10)
+            if not hasattr(self, "main_camera_stack_container"):
+                self.main_camera_stack_container = QWidget()
+                self.main_camera_stack_container.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
+                self.main_camera_stack_container.setStyleSheet("background-color: transparent;")
+            self.main_camera_stack_container.setMinimumHeight(0)
+            self.main_camera_stack_container.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
+            camera_layout.addWidget(self.main_camera_stack_container, 1)
+            right_layout.addWidget(camera_group, 1)
 
         root_layout.addWidget(left_column, 0, 0)
         root_layout.addWidget(center_column, 0, 1)
@@ -451,13 +638,12 @@ class DriverUIHelpers:
         center_column.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         right_column.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
 
-        if frame_robot_control is not None:
-            frame_robot_control.setMinimumHeight(116)
-        if frame_keyboard is not None:
-            frame_keyboard.setMinimumHeight(280)
-        if main_camera_placeholder is not None:
-            main_camera_placeholder.setMinimumWidth(220)
-            main_camera_placeholder.setMinimumHeight(320)
+        control_group.setMinimumHeight(140)
+        if hasattr(self, "main_camera_placeholder"):
+            self.main_camera_placeholder.hide()
+        if hasattr(self, "main_camera_stack_container"):
+            self.main_camera_stack_container.setMinimumWidth(220)
+            self.main_camera_stack_container.setMinimumHeight(0)
 
     def setup_odometry_tab(self):
         self.odometry_tab = QWidget()
@@ -485,6 +671,20 @@ class DriverUIHelpers:
             summary_layout.addWidget(label)
         layout.addWidget(summary_group, 0, 2)
 
+        mechanism_group = QGroupBox("Mechanism Encoders")
+        mechanism_layout = QVBoxLayout(mechanism_group)
+        self.odo_tab_elevator_left_encoder_label = QLabel("Elevator Left: 0")
+        self.odo_tab_elevator_right_encoder_label = QLabel("Elevator Right: 0")
+        self.odo_tab_arm_motor_encoder_label = QLabel("Arm Motor: 0")
+        for label in (
+            self.odo_tab_elevator_left_encoder_label,
+            self.odo_tab_elevator_right_encoder_label,
+            self.odo_tab_arm_motor_encoder_label,
+        ):
+            mechanism_layout.addWidget(label)
+        mechanism_layout.addStretch(1)
+        layout.addWidget(mechanism_group, 1, 2)
+
         context_group = QGroupBox("Field Context")
         context_layout = QVBoxLayout(context_group)
         self.odo_tab_alliance_label = QLabel("Alliance: Red")
@@ -498,7 +698,7 @@ class DriverUIHelpers:
             self.odo_tab_field_size_label,
         ):
             context_layout.addWidget(label)
-        layout.addWidget(context_group, 1, 2)
+        layout.addWidget(context_group, 2, 2)
 
         actions_group = QGroupBox("Actions")
         actions_layout = QVBoxLayout(actions_group)
@@ -514,9 +714,120 @@ class DriverUIHelpers:
         mode_row.addWidget(self.odo_tab_hybrid_button)
         actions_layout.addLayout(mode_row)
         actions_layout.addStretch(1)
-        layout.addWidget(actions_group, 2, 2)
+        layout.addWidget(actions_group, 3, 2)
 
         self.main_tabs.addTab(self.odometry_tab, "Odometry")
+
+    def setup_settings_tab(self):
+        self.settings_tab = QWidget()
+        layout = QGridLayout(self.settings_tab)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setHorizontalSpacing(12)
+        layout.setVerticalSpacing(12)
+
+        drive_group = QGroupBox("Drive Settings")
+        drive_layout = QVBoxLayout(drive_group)
+        self.settings_keyboard_speed_label = QLabel("Keyboard Speed: 70%")
+        self.settings_keyboard_speed_slider = QSlider(Qt.Orientation.Horizontal)
+        self.settings_keyboard_speed_slider.setMinimum(0)
+        self.settings_keyboard_speed_slider.setMaximum(100)
+        self.settings_keyboard_speed_slider.setValue(70)
+        self.settings_slow_drive_checkbox = QCheckBox("Enable Slow Drive")
+        self.settings_disable_drive_checkbox = QCheckBox("Disable Drive")
+        self.settings_only_drive_checkbox = QCheckBox("Only Drive")
+        for widget in (
+            self.settings_keyboard_speed_label,
+            self.settings_keyboard_speed_slider,
+            self.settings_slow_drive_checkbox,
+            self.settings_disable_drive_checkbox,
+            self.settings_only_drive_checkbox,
+        ):
+            drive_layout.addWidget(widget)
+        drive_layout.addStretch(1)
+        layout.addWidget(drive_group, 0, 0)
+
+        vision_group = QGroupBox("Vision and Sensors")
+        vision_layout = QVBoxLayout(vision_group)
+        self.settings_disable_vision_checkbox = QCheckBox("Disable Vision")
+        self.settings_check_odo_checkbox = QCheckBox("Check Odometry")
+        self.settings_camera_base_label = QLabel(f"Camera Base URL: {os.environ.get('KSU_CAMERA_BASE_URL', 'http://10.42.0.3:8080')}")
+        self.settings_camera_streams = QPlainTextEdit()
+        self.settings_camera_streams.setReadOnly(True)
+        self.settings_camera_streams.setPlainText(
+            "\n".join(f"{feed.label}: {feed.stream_url}" for feed in CAMERA_FEEDS)
+        )
+        vision_layout.addWidget(self.settings_disable_vision_checkbox)
+        vision_layout.addWidget(self.settings_check_odo_checkbox)
+        vision_layout.addWidget(self.settings_camera_base_label)
+        vision_layout.addWidget(self.settings_camera_streams, 1)
+        layout.addWidget(vision_group, 0, 1)
+
+        match_group = QGroupBox("Match Preferences")
+        match_layout = QVBoxLayout(match_group)
+        self.settings_end_after_teleop_checkbox = QCheckBox("End After Teleop")
+        self.settings_alliance_summary = QLabel("Alliance: Red")
+        self.settings_mode_summary = QLabel("Mode: Stopped")
+        self.settings_odometry_summary = QLabel("Odometry Mode: Pre_Start")
+        self.settings_auto_summary = QLabel("Selected Auto: None")
+        self.settings_auto_status_summary = QLabel("Auto Status: Idle")
+        for widget in (
+            self.settings_end_after_teleop_checkbox,
+            self.settings_alliance_summary,
+            self.settings_mode_summary,
+            self.settings_odometry_summary,
+            self.settings_auto_summary,
+            self.settings_auto_status_summary,
+        ):
+            match_layout.addWidget(widget)
+        match_layout.addStretch(1)
+        layout.addWidget(match_group, 1, 0, 1, 2)
+
+        self.main_tabs.addTab(self.settings_tab, "Settings")
+
+    def setup_network_tab(self):
+        self.network_tab = QWidget()
+        layout = QGridLayout(self.network_tab)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setHorizontalSpacing(12)
+        layout.setVerticalSpacing(12)
+
+        connection_group = QGroupBox("Connection Status")
+        connection_layout = QVBoxLayout(connection_group)
+        self.network_status_label = QLabel("Status: Disconnected")
+        self.network_active_address_label = QLabel("Active Address: N/A")
+        self.network_ping_label = QLabel("Last Ping: -- ms")
+        self.network_robot_mode_label = QLabel("Robot Mode: Stopped")
+        self.network_last_telemetry_label = QLabel("Last Telemetry: Never")
+        for widget in (
+            self.network_status_label,
+            self.network_active_address_label,
+            self.network_ping_label,
+            self.network_robot_mode_label,
+            self.network_last_telemetry_label,
+        ):
+            connection_layout.addWidget(widget)
+        connection_layout.addStretch(1)
+        layout.addWidget(connection_group, 0, 0)
+
+        addresses_group = QGroupBox("Known Robot Addresses")
+        addresses_layout = QVBoxLayout(addresses_group)
+        self.network_addresses_view = QPlainTextEdit()
+        self.network_addresses_view.setReadOnly(True)
+        self.network_addresses_view.setPlainText("\n".join(DEFAULT_ROBOT_ADDRESSES))
+        addresses_layout.addWidget(self.network_addresses_view)
+        layout.addWidget(addresses_group, 0, 1)
+
+        camera_group = QGroupBox("Camera Endpoints")
+        camera_layout = QVBoxLayout(camera_group)
+        self.network_camera_endpoints = QPlainTextEdit()
+        self.network_camera_endpoints.setReadOnly(True)
+        self.network_camera_endpoints.setPlainText(
+            "\n".join(f"{feed.label}: {feed.stream_url}" for feed in CAMERA_FEEDS)
+        )
+        camera_layout.addWidget(self.network_camera_endpoints)
+        layout.addWidget(camera_group, 1, 0, 1, 2)
+
+        self.main_tabs.addTab(self.network_tab, "Network")
 
     def setup_diagnostics_tab(self):
         self.diagnostics_tab = QWidget()
@@ -590,20 +901,35 @@ class DriverUIHelpers:
 
     def setup_main_camera_view(self):
         self.main_camera_views = {}
+        self.center_driver_camera_view = None
 
-        if hasattr(self, "main_camera_placeholder"):
-            container = self.main_camera_placeholder
+        if hasattr(self, "main_camera_stack_container"):
+            container = self.main_camera_stack_container
             if container.layout() is None:
                 layout = QVBoxLayout(container)
                 layout.setContentsMargins(0, 0, 0, 0)
-                layout.setSpacing(6)
+                layout.setSpacing(10)
             else:
                 layout = container.layout()
             for feed in CAMERA_FEEDS:
                 view = CameraView(feed.label)
-                view.setMinimumSize(120, 90)
+                view.setMinimumSize(220, 180)
+                view.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
                 self.main_camera_views[feed.name] = view
-                layout.addWidget(view)
+                layout.addWidget(view, 1)
+
+        if hasattr(self, "main_driver_camera_placeholder"):
+            container = self.main_driver_camera_placeholder
+            if container.layout() is None:
+                layout = QVBoxLayout(container)
+                layout.setContentsMargins(0, 0, 0, 0)
+            else:
+                layout = container.layout()
+
+            if getattr(self, "center_driver_camera_view", None) is None:
+                self.center_driver_camera_view = CameraView("Driver Camera\nWaiting for stream...")
+                self.center_driver_camera_view.setMinimumSize(320, 240)
+                layout.addWidget(self.center_driver_camera_view, 1)
 
     def setup_camera_stream(self):
         self.camera_streams = {}
@@ -617,6 +943,10 @@ class DriverUIHelpers:
             main_view = getattr(self, "main_camera_views", {}).get(feed.name)
             if main_view is not None:
                 views.append(main_view)
+            if feed.name == "driver":
+                center_driver_view = getattr(self, "center_driver_camera_view", None)
+                if center_driver_view is not None:
+                    views.append(center_driver_view)
 
             self.camera_views[feed.name] = views
 
@@ -630,10 +960,10 @@ class DriverUIHelpers:
             stream.start()
 
     def handle_camera_frame(self, camera_name, image):
-        for view in self.camera_views.get(camera_name, []):
-            view.set_frame(image)
+        self._camera_latest_frames[camera_name] = image
 
     def handle_camera_status(self, camera_name, status):
+        self._camera_status_cache[camera_name] = status
         feed = next((item for item in CAMERA_FEEDS if item.name == camera_name), None)
         status_prefix = feed.label if feed is not None else camera_name
         status_label = getattr(self, "camera_tab_status_labels", {}).get(camera_name)
@@ -643,10 +973,71 @@ class DriverUIHelpers:
         self.append_diagnostic("camera", f"{status_prefix}: {status}")
 
         for view in self.camera_views.get(camera_name, []):
-            if not view.has_frame():
+            if hasattr(view, "has_frame") and not view.has_frame():
                 view.setText(f"{status_prefix}\n{status}")
 
+    def _visible_camera_views(self, camera_name):
+        if not hasattr(self, "main_tabs"):
+            return []
+
+        current_widget = self.main_tabs.currentWidget()
+        visible_views = []
+
+        if current_widget is self.frame:
+            main_view = getattr(self, "main_camera_views", {}).get(camera_name)
+            if main_view is not None:
+                visible_views.append(main_view)
+            if camera_name == "driver":
+                center_driver_view = getattr(self, "center_driver_camera_view", None)
+                center_tabs = getattr(self, "main_center_tabs", None)
+                driver_tab = getattr(self, "main_driver_camera_tab", None)
+                if (
+                    center_driver_view is not None
+                    and center_tabs is not None
+                    and driver_tab is not None
+                    and center_tabs.currentWidget() is driver_tab
+                ):
+                    visible_views.append(center_driver_view)
+
+        if current_widget is getattr(self, "camera_tab", None):
+            tab_view = getattr(self, "camera_tab_views", {}).get(camera_name)
+            if tab_view is not None:
+                visible_views.append(tab_view)
+
+        return visible_views
+
+    def _flush_camera_frames(self):
+        latest_frames = getattr(self, "_camera_latest_frames", None)
+        if not latest_frames:
+            return
+
+        for camera_name, image in list(latest_frames.items()):
+            visible_views = self._visible_camera_views(camera_name)
+            if not visible_views:
+                continue
+            for view in visible_views:
+                view.set_frame(image)
+
+    def _handle_tab_changed(self, index):
+        del index
+        self._flush_camera_frames()
+
+        current_widget = self.main_tabs.currentWidget()
+        if current_widget not in (self.frame, getattr(self, "camera_tab", None)):
+            return
+
+        for feed in CAMERA_FEEDS:
+            status = self._camera_status_cache.get(feed.name)
+            if not status:
+                continue
+            for view in self._visible_camera_views(feed.name):
+                if not view.has_frame():
+                    view.setText(f"{feed.label}\n{status}")
+
     def stop_camera_stream(self):
+        render_timer = getattr(self, "_camera_render_timer", None)
+        if render_timer is not None:
+            render_timer.stop()
         for stream in getattr(self, "camera_streams", {}).values():
             stream.stop()
         for stream in getattr(self, "camera_streams", {}).values():

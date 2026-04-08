@@ -275,15 +275,62 @@
         </item>
        </layout>
       </widget>
-      <widget class="QWidget" name="field_view_placeholder" native="true">
+      <widget class="QTabWidget" name="main_center_tabs">
        <property name="geometry">
         <rect>
          <x>265</x>
          <y>120</y>
          <width>621</width>
-         <height>311</height>
+         <height>471</height>
         </rect>
        </property>
+       <property name="currentIndex">
+        <number>0</number>
+       </property>
+       <widget class="QWidget" name="main_field_tab">
+        <attribute name="title">
+         <string>Field Map</string>
+        </attribute>
+        <layout class="QVBoxLayout" name="verticalLayout_main_field_tab">
+         <property name="leftMargin">
+          <number>0</number>
+         </property>
+         <property name="topMargin">
+          <number>0</number>
+         </property>
+         <property name="rightMargin">
+          <number>0</number>
+         </property>
+         <property name="bottomMargin">
+          <number>0</number>
+         </property>
+         <item>
+          <widget class="QWidget" name="field_view_placeholder" native="true"/>
+         </item>
+        </layout>
+       </widget>
+       <widget class="QWidget" name="main_driver_camera_tab">
+        <attribute name="title">
+         <string>Driver Camera</string>
+        </attribute>
+        <layout class="QVBoxLayout" name="verticalLayout_main_driver_camera_tab">
+         <property name="leftMargin">
+          <number>0</number>
+         </property>
+         <property name="topMargin">
+          <number>0</number>
+         </property>
+         <property name="rightMargin">
+          <number>0</number>
+         </property>
+         <property name="bottomMargin">
+          <number>0</number>
+         </property>
+         <item>
+          <widget class="QWidget" name="main_driver_camera_placeholder" native="true"/>
+         </item>
+        </layout>
+       </widget>
       </widget>
       <widget class="QFrame" name="frame_keyboard">
        <property name="geometry">
@@ -291,7 +338,7 @@
          <x>890</x>
          <y>0</y>
          <width>191</width>
-         <height>361</height>
+         <height>591</height>
         </rect>
        </property>
        <property name="styleSheet">
@@ -302,126 +349,15 @@
        </property>
        <layout class="QVBoxLayout" name="verticalLayout_keyboard">
         <item>
-         <widget class="QLabel" name="keyboard_title">
-          <property name="text">
-           <string>&lt;b&gt;Keyboard Controls&lt;/b&gt;</string>
+         <widget class="QWidget" name="main_camera_stack_container" native="true">
+          <property name="minimumSize">
+           <size>
+            <width>220</width>
+            <height>0</height>
+           </size>
           </property>
-          <property name="alignment">
-           <set>Qt::AlignmentFlag::AlignCenter</set>
-          </property>
-         </widget>
-        </item>
-        <item>
-         <layout class="QGridLayout" name="gridLayout_keyboard">
-          <item row="0" column="0">
-           <widget class="QLabel" name="label_wasd">
-            <property name="text">
-             <string>&lt;b&gt;Movement:&lt;/b&gt;</string>
-            </property>
-           </widget>
-          </item>
-          <item row="1" column="0">
-           <widget class="QLabel" name="label_w">
-            <property name="text">
-             <string>W - Forward</string>
-            </property>
-           </widget>
-          </item>
-          <item row="2" column="0">
-           <widget class="QLabel" name="label_s">
-            <property name="text">
-             <string>S - Backward</string>
-            </property>
-           </widget>
-          </item>
-          <item row="3" column="0">
-           <widget class="QLabel" name="label_a">
-            <property name="text">
-             <string>A - Strafe Left</string>
-            </property>
-           </widget>
-          </item>
-          <item row="4" column="0">
-           <widget class="QLabel" name="label_d">
-            <property name="text">
-             <string>D - Strafe Right</string>
-            </property>
-           </widget>
-          </item>
-          <item row="5" column="0">
-           <widget class="QLabel" name="label_rotation">
-            <property name="text">
-             <string>&lt;b&gt;Rotation:&lt;/b&gt;</string>
-            </property>
-           </widget>
-          </item>
-          <item row="6" column="0">
-           <widget class="QLabel" name="label_q">
-            <property name="text">
-             <string>Q - Rotate Left</string>
-            </property>
-           </widget>
-          </item>
-          <item row="7" column="0">
-           <widget class="QLabel" name="label_e">
-            <property name="text">
-             <string>E - Rotate Right</string>
-            </property>
-           </widget>
-          </item>
-          <item row="8" column="0">
-           <widget class="QLabel" name="label_special">
-            <property name="text">
-             <string>&lt;b&gt;Special:&lt;/b&gt;</string>
-            </property>
-           </widget>
-          </item>
-          <item row="9" column="0">
-           <widget class="QLabel" name="label_shift">
-            <property name="text">
-             <string>Shift - Speed Boost</string>
-            </property>
-           </widget>
-          </item>
-          <item row="10" column="0">
-           <widget class="QLabel" name="label_space">
-            <property name="text">
-             <string>Space - Emergency Stop</string>
-            </property>
-           </widget>
-          </item>
-         </layout>
-        </item>
-        <item>
-         <widget class="Line" name="line">
-          <property name="orientation">
-           <enum>Qt::Orientation::Horizontal</enum>
-          </property>
-         </widget>
-        </item>
-        <item>
-         <widget class="QLabel" name="keyboard_speed_label">
-          <property name="text">
-           <string>Keyboard Speed: 100%</string>
-          </property>
-          <property name="alignment">
-           <set>Qt::AlignmentFlag::AlignCenter</set>
-          </property>
-         </widget>
-        </item>
-        <item>
-         <widget class="QSlider" name="keyboard_speed_slider">
-          <property name="minimum">
-           <number>0</number>
-          </property>
-          <property name="maximum">
-           <number>100</number>
-          </property>
-          <property name="value">
-           <number>100</number>
-          </property>
-          <property name="orientation">
-           <enum>Qt::Orientation::Horizontal</enum>
+          <property name="styleSheet">
+           <string notr="true"/>
           </property>
          </widget>
         </item>

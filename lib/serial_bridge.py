@@ -33,6 +33,11 @@ class SerialBridge:
             "encoders": [0, 0, 0, 0, 0, 0, 0],
             "relay": 0,
             "servo_ok": True,
+            "mode": "STOPPED",
+            "drive_enabled": False,
+            "drive_cmd": [0.0, 0.0, 0.0, 0.0],
+            "mech_cmd": [0.0, 0.0, 0.0],
+            "last_status": {},
             "bridge_connected": False,
         }
 
@@ -110,6 +115,7 @@ class SerialBridge:
     def get_latest_telemetry(self) -> Dict[str, Any]:
         connected = (time.time() - self.last_rx_time) < 1.0
         data = dict(self.latest_telemetry)
+        data["last_status"] = dict(self.last_status)
         data["bridge_connected"] = connected
         return data
 
@@ -120,10 +126,17 @@ class SerialBridge:
         if msg_type == "telemetry":
             self.latest_telemetry.update(msg)
             if SERIAL_BRIDGE_DEBUG:
-                logger.info("RX telemetry: mode=%s relay=%s encoders=%s",
-                            msg.get("mode"), msg.get("relay"), msg.get("encoders"))
+                logger.info(
+                    "RX telemetry: mode=%s drive_enabled=%s drive_cmd=%s relay=%s encoders=%s",
+                    msg.get("mode"),
+                    msg.get("drive_enabled"),
+                    msg.get("drive_cmd"),
+                    msg.get("relay"),
+                    msg.get("encoders"),
+                )
         elif msg_type in ("ack", "pong", "hello", "fault", "status"):
             self.last_status = msg
+            self.latest_telemetry["last_status"] = dict(msg)
             if SERIAL_BRIDGE_DEBUG:
                 logger.info("RX status: %s", msg)
             if msg_type == "fault":

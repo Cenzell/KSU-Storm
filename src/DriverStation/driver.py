@@ -22,6 +22,7 @@ for path in (LIB_DIR, UI_DIR):
         sys.path.insert(0, path_str)
 
 import comm
+from auto_routines import AUTO_ROUTINES, routine_description, routine_keys, routine_label, routine_payload
 from driver_ui import DriverUIHelpers
 
 # Configure logging
@@ -91,6 +92,8 @@ class AppWindow(DriverUIHelpers, QMainWindow):
         self.current_alliance = "RED"
         self.current_pose = {"x": 0.0, "y": 0.0, "theta_deg": 0.0}
         self.expected_pose = self.current_pose.copy()
+        self.selected_auto_key = routine_keys()[0] if routine_keys() else ""
+        self.current_auto_status = {"active": False, "status": "idle"}
         self._last_diagnostic_telemetry_time = 0.0
         self._last_diagnostic_controls = None
 
@@ -133,6 +136,14 @@ class AppWindow(DriverUIHelpers, QMainWindow):
             self.odo_tab_motor_button.clicked.connect(lambda: self.set_odometry_mode("MOTOR"))
         if hasattr(self, 'odo_tab_hybrid_button'):
             self.odo_tab_hybrid_button.clicked.connect(lambda: self.set_odometry_mode("HYBRID"))
+        if hasattr(self, "auto_routine_selector"):
+            for key in routine_keys():
+                self.auto_routine_selector.addItem(routine_label(key), key)
+            self.auto_routine_selector.currentIndexChanged.connect(self.on_auto_routine_changed)
+        if hasattr(self, "auto_run_selected_button"):
+            self.auto_run_selected_button.clicked.connect(self.run_selected_auto)
+        if hasattr(self, "auto_cancel_button"):
+            self.auto_cancel_button.clicked.connect(self.cancel_auto)
         
         # Setup keyboard speed slider if it exists in UI
         if hasattr(self, 'keyboard_speed_slider'):
@@ -148,6 +159,10 @@ class AppWindow(DriverUIHelpers, QMainWindow):
         self.append_diagnostic("telemetry", "Telemetry receiver started")
         self._update_alliance_button()
         self._update_odometry_context_labels()
+        self._sync_settings_tab_controls()
+        self._update_network_status_labels(False, "N/A")
+        self._refresh_auto_selection_ui()
+        self._update_auto_status_labels({"active": False, "status": "idle"})
 
     def _alliance_start_pose(self):
         half_robot = 18.0 * 0.0254 / 2.0
@@ -167,6 +182,8 @@ class AppWindow(DriverUIHelpers, QMainWindow):
 
         if hasattr(self, "odo_tab_alliance_label"):
             self.odo_tab_alliance_label.setText(f"Alliance: {self.current_alliance.title()}")
+        if hasattr(self, "settings_alliance_summary"):
+            self.settings_alliance_summary.setText(f"Alliance: {self.current_alliance.title()}")
 
     def _update_odometry_context_labels(self):
         if hasattr(self, "odo_tab_mode_label"):
@@ -174,9 +191,173 @@ class AppWindow(DriverUIHelpers, QMainWindow):
         if hasattr(self, "odo_tab_odo_mode_label") and hasattr(self, "label_odo_mode"):
             current_text = self.label_odo_mode.text().replace("Odometry Mode: ", "")
             self.odo_tab_odo_mode_label.setText(f"Odometry Mode: {current_text}")
+        if hasattr(self, "settings_mode_summary"):
+            self.settings_mode_summary.setText(f"Mode: {self.current_mode.title()}")
+        if hasattr(self, "settings_odometry_summary") and hasattr(self, "label_odo_mode"):
+            current_text = self.label_odo_mode.text().replace("Odometry Mode: ", "")
+            self.settings_odometry_summary.setText(f"Odometry Mode: {current_text}")
+        if hasattr(self, "settings_auto_summary"):
+            self.settings_auto_summary.setText(
+                f"Selected Auto: {routine_label(self.selected_auto_key) if self.selected_auto_key else 'None'}"
+            )
         if hasattr(self, "odo_tab_field_size_label"):
             self.odo_tab_field_size_label.setText(
                 f"Field: {self.field_widget.field_width_m:.3f} m x {self.field_widget.field_height_m:.3f} m"
+            )
+
+    def _refresh_auto_selection_ui(self):
+        selected_label = routine_label(self.selected_auto_key) if self.selected_auto_key else "None"
+        selected_description = routine_description(self.selected_auto_key) if self.selected_auto_key else ""
+
+        if hasattr(self, "auto_routine_selector"):
+            index = self.auto_routine_selector.findData(self.selected_auto_key)
+            if index >= 0 and self.auto_routine_selector.currentIndex() != index:
+                self.auto_routine_selector.blockSignals(True)
+                self.auto_routine_selector.setCurrentIndex(index)
+                self.auto_routine_selector.blockSignals(False)
+
+        if hasattr(self, "auto_routine_description_label"):
+            self.auto_routine_description_label.setText(
+                f"Selected Auto: {selected_label}"
+                + (f" | {selected_description}" if selected_description else "")
+            )
+
+        if hasattr(self, "settings_auto_summary"):
+            self.settings_auto_summary.setText(f"Selected Auto: {selected_label}")
+
+    def _update_auto_status_labels(self, auto_status):
+        auto_status = auto_status or {"active": False, "status": "idle"}
+        self.current_auto_status = dict(auto_status)
+        status_text = str(auto_status.get("status", "idle")).replace("_", " ").title()
+        routine_name = auto_status.get("routine_name")
+        if not routine_name and self.selected_auto_key:
+            routine_name = routine_label(self.selected_auto_key)
+        step_name = auto_status.get("step_name")
+        step_index = int(auto_status.get("step_index", 0))
+        step_count = int(auto_status.get("step_count", 0))
+        last_error = auto_status.get("last_error")
+
+        if hasattr(self, "auto_status_label"):
+            self.auto_status_label.setText(f"Auto Status: {status_text}")
+
+        detail_parts = []
+        if routine_name:
+            detail_parts.append(f"Routine {routine_name}")
+        if step_count > 0:
+            detail_parts.append(f"Step {step_index + 1}/{step_count}")
+        if step_name:
+            detail_parts.append(str(step_name))
+        if last_error:
+            detail_parts.append(f"Note: {last_error}")
+        detail_text = " | ".join(detail_parts) if detail_parts else "No routine running"
+
+        if hasattr(self, "auto_status_detail_label"):
+            self.auto_status_detail_label.setText(f"Auto Detail: {detail_text}")
+        if hasattr(self, "settings_auto_status_summary"):
+            self.settings_auto_status_summary.setText(f"Auto Status: {status_text}")
+
+    def on_auto_routine_changed(self, index):
+        if not hasattr(self, "auto_routine_selector"):
+            return
+        selected_key = self.auto_routine_selector.itemData(index)
+        if not selected_key:
+            return
+        self.selected_auto_key = str(selected_key)
+        self._refresh_auto_selection_ui()
+        self.append_diagnostic("controls", f"Selected auto routine: {routine_label(self.selected_auto_key)}")
+
+    def run_selected_auto(self):
+        if not self.selected_auto_key:
+            self.append_diagnostic("controls", "No auto routine selected")
+            return False
+
+        client = self.conn_manager.get_client()
+        if not client:
+            self.append_diagnostic("controls", "Cannot run auto: robot not connected")
+            return False
+
+        try:
+            response = client.run_auto_routine(routine_payload(self.selected_auto_key))
+        except KeyError as exc:
+            logger.error("Unknown auto routine: %s", exc)
+            self.append_diagnostic("controls", str(exc))
+            return False
+
+        if not response or response.get("status") != "success":
+            self.append_diagnostic("controls", f"Failed to start auto: {routine_label(self.selected_auto_key)}")
+            return False
+
+        self.current_mode = "AUTO"
+        self.robot_status.setText("Autonomous")
+        self._update_odometry_context_labels()
+        self._update_auto_status_labels(response.get("auto"))
+        self.start_match_timer()
+        self.append_diagnostic("controls", f"Started auto routine: {routine_label(self.selected_auto_key)}")
+        return True
+
+    def cancel_auto(self):
+        client = self.conn_manager.get_client()
+        if not client:
+            self.append_diagnostic("controls", "Cannot cancel auto: robot not connected")
+            return False
+
+        response = client.cancel_auto_routine()
+        if not response or response.get("status") != "success":
+            self.append_diagnostic("controls", "Failed to cancel auto routine")
+            return False
+
+        self._update_auto_status_labels(response.get("auto"))
+        self.append_diagnostic("controls", "Auto routine cancelled")
+        return True
+
+    def _sync_settings_tab_controls(self):
+        checkbox_pairs = [
+            ("slow_drive", "settings_slow_drive_checkbox"),
+            ("disable_drive", "settings_disable_drive_checkbox"),
+            ("only_drive", "settings_only_drive_checkbox"),
+            ("disable_vision", "settings_disable_vision_checkbox"),
+            ("check_odo", "settings_check_odo_checkbox"),
+            ("end_after_teleop", "settings_end_after_teleop_checkbox"),
+        ]
+
+        for source_name, target_name in checkbox_pairs:
+            source = getattr(self, source_name, None)
+            target = getattr(self, target_name, None)
+            if source is None or target is None:
+                continue
+
+            target.blockSignals(True)
+            target.setChecked(source.isChecked())
+            target.blockSignals(False)
+            target.toggled.connect(source.setChecked)
+            source.toggled.connect(target.setChecked)
+
+        if hasattr(self, "settings_keyboard_speed_slider"):
+            self.settings_keyboard_speed_slider.blockSignals(True)
+            self.settings_keyboard_speed_slider.setValue(int(self.keyboard_speed * 100))
+            self.settings_keyboard_speed_slider.blockSignals(False)
+            self.settings_keyboard_speed_slider.valueChanged.connect(self.update_keyboard_speed)
+        if hasattr(self, "settings_keyboard_speed_label"):
+            self.settings_keyboard_speed_label.setText(f"Keyboard Speed: {self.keyboard_speed:.0%}")
+
+    def _update_network_status_labels(self, is_connected, address):
+        if hasattr(self, "network_status_label"):
+            self.network_status_label.setText(
+                "Status: Connected" if is_connected else "Status: Disconnected"
+            )
+        if hasattr(self, "network_active_address_label"):
+            self.network_active_address_label.setText(f"Active Address: {address}")
+
+    def _update_network_ping_label(self, ping_ms):
+        if hasattr(self, "network_ping_label"):
+            self.network_ping_label.setText(f"Last Ping: {ping_ms:.1f} ms")
+
+    def _update_network_telemetry_labels(self, data):
+        if hasattr(self, "network_robot_mode_label"):
+            self.network_robot_mode_label.setText(f"Robot Mode: {data.get('mode', self.current_mode)}")
+        if hasattr(self, "network_last_telemetry_label"):
+            self.network_last_telemetry_label.setText(
+                f"Last Telemetry: {time.strftime('%H:%M:%S')}"
             )
 
     def set_alliance(self, alliance):
@@ -215,6 +396,28 @@ class AppWindow(DriverUIHelpers, QMainWindow):
             self.odo_tab_y_label.setText(f"Y: {y_m:.2f} m")
         if hasattr(self, 'odo_tab_theta_label'):
             self.odo_tab_theta_label.setText(f"Theta: {theta_deg:.1f} deg")
+
+    def update_mechanism_encoder_labels(self, encoders):
+        values = list(encoders) if isinstance(encoders, list) else []
+
+        def encoder_value(index):
+            if index >= len(values):
+                return 0
+            try:
+                return int(values[index])
+            except Exception:
+                return 0
+
+        elevator_left = encoder_value(4)
+        elevator_right = encoder_value(5)
+        arm_motor = encoder_value(6)
+
+        if hasattr(self, "odo_tab_elevator_left_encoder_label"):
+            self.odo_tab_elevator_left_encoder_label.setText(f"Elevator Left: {elevator_left}")
+        if hasattr(self, "odo_tab_elevator_right_encoder_label"):
+            self.odo_tab_elevator_right_encoder_label.setText(f"Elevator Right: {elevator_right}")
+        if hasattr(self, "odo_tab_arm_motor_encoder_label"):
+            self.odo_tab_arm_motor_encoder_label.setText(f"Arm Motor: {arm_motor}")
 
     def update_expected_pose(self):
         """Project a short-horizon expected pose from current command inputs."""
@@ -296,10 +499,8 @@ class AppWindow(DriverUIHelpers, QMainWindow):
     
     def set_auto_mode(self):
         """Switch robot to autonomous mode."""
-        if self._set_robot_mode("AUTO"):
-            self.start_match_timer()
-            logger.info("Switched to AUTO mode")
-            self.append_diagnostic("controls", "Mode changed to AUTO")
+        if self.run_selected_auto():
+            logger.info("Started selected autonomous routine")
     
     def set_teleop_mode(self):
         """Switch robot to teleoperated mode (manual start)."""
@@ -326,6 +527,7 @@ class AppWindow(DriverUIHelpers, QMainWindow):
             client.reset_robot()
             self.current_mode = "STOPPED"
             self.robot_status.setText("Stopped")
+            self._update_auto_status_labels({"active": False, "status": "idle"})
             self.stop_match_timer()
             logger.info("Robot reset")
             self.append_diagnostic("controls", "Robot reset requested")
@@ -349,6 +551,7 @@ class AppWindow(DriverUIHelpers, QMainWindow):
             self.robot_status.setText("Teleoperated")
         else:
             self.robot_status.setText("Stopped")
+            self._update_auto_status_labels({"active": False, "status": "idle"})
         self._update_odometry_context_labels()
         return True
 
@@ -444,6 +647,7 @@ class AppWindow(DriverUIHelpers, QMainWindow):
     def handle_ping_response(self, ping_ms):
         """Handle ping response from robot."""
         self.ping_label.setText(f"Ping: {ping_ms:.1f} ms")
+        self._update_network_ping_label(ping_ms)
         self.append_diagnostic("connection", f"Ping response: {ping_ms:.1f} ms")
     
     def handle_telemetry(self, data):
@@ -455,6 +659,8 @@ class AppWindow(DriverUIHelpers, QMainWindow):
             pose = data.get('pose', {})
             odometry_mode = data.get('odometry_mode')
             alliance = data.get('alliance')
+            auto_status = data.get('auto')
+            encoders = data.get('encoders', [])
 
             width_m = float(field.get('width_m', self.field_widget.field_width_m))
             height_m = float(field.get('height_m', self.field_widget.field_height_m))
@@ -470,6 +676,7 @@ class AppWindow(DriverUIHelpers, QMainWindow):
             self.update_odometry_labels(x_m, y_m, theta_deg)
             self.current_pose = {"x": x_m, "y": y_m, "theta_deg": theta_deg}
             self.update_expected_pose()
+            self.update_mechanism_encoder_labels(encoders)
 
             if odometry_mode and hasattr(self, 'label_odo_mode'):
                 self.label_odo_mode.setText(f"Odometry Mode: {str(odometry_mode).title()}")
@@ -478,7 +685,10 @@ class AppWindow(DriverUIHelpers, QMainWindow):
             if alliance:
                 self.current_alliance = str(alliance).upper()
                 self._update_alliance_button()
+            if auto_status is not None:
+                self._update_auto_status_labels(auto_status)
             self._update_odometry_context_labels()
+            self._update_network_telemetry_labels(data)
         except Exception as e:
             logger.error(f"Error parsing telemetry pose: {e}")
             self.append_diagnostic("telemetry", f"Telemetry parse error: {e}")
@@ -494,6 +704,12 @@ class AppWindow(DriverUIHelpers, QMainWindow):
         self.keyboard_speed = value / 100.0
         if hasattr(self, 'keyboard_speed_label'):
             self.keyboard_speed_label.setText(f"Keyboard Speed: {self.keyboard_speed:.0%}")
+        if hasattr(self, 'settings_keyboard_speed_label'):
+            self.settings_keyboard_speed_label.setText(f"Keyboard Speed: {self.keyboard_speed:.0%}")
+        if hasattr(self, 'settings_keyboard_speed_slider') and self.settings_keyboard_speed_slider.value() != value:
+            self.settings_keyboard_speed_slider.blockSignals(True)
+            self.settings_keyboard_speed_slider.setValue(value)
+            self.settings_keyboard_speed_slider.blockSignals(False)
         logger.debug(f"Keyboard speed set to {self.keyboard_speed:.0%}")
     
     def keyPressEvent(self, event):
@@ -594,14 +810,17 @@ class AppWindow(DriverUIHelpers, QMainWindow):
         if is_connected:
             self.status_label.setText("Status: <b style='color: green;'>Connected</b>")
             self.address_label.setText(f"Address: {address}")
+            self._update_network_status_labels(True, address)
             logger.info(f"Connected to {address}")
             self.append_diagnostic("connection", f"Connected to {address}")
         else:
             self.status_label.setText("Status: <b style='color: red;'>Disconnected</b>")
             self.address_label.setText("Address: N/A")
             self.ping_label.setText("Ping: -- ms")
+            self._update_network_status_labels(False, "N/A")
             self.robot_status.setText("Stopped")
             self.current_mode = "STOPPED"
+            self._update_auto_status_labels({"active": False, "status": "idle"})
             self._update_odometry_context_labels()
             
             # Reset button colors

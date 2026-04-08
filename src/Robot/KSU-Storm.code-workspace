@@ -6,6 +6,10 @@
 		{
 			"name": "260401-173624-nano_every",
 			"path": "../../../../Documents/PlatformIO/Projects/260401-173624-nano_every"
+		},
+		{
+			"name": "Storm-TeencyFirmware",
+			"path": "firmware/Storm-TeencyFirmware"
 		}
 	],
 	"settings": {}
