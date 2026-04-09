@@ -180,10 +180,11 @@ class CameraWorker:
 def default_camera_configs() -> Dict[str, CameraConfig]:
     shared_calibration = _env("KSU_CAMERA_CALIBRATION_FILE", "camera_calibration.json")
     return {
+        # USB camera, OpenCV index 0.
         "front_left": CameraConfig(
             name="front_left",
             label=_env("KSU_CAMERA_FRONT_LEFT_LABEL", "Front Left"),
-            backend=_env("KSU_CAMERA_FRONT_LEFT_BACKEND", "picamera2"),
+            backend=_env("KSU_CAMERA_FRONT_LEFT_BACKEND", "opencv"),
             selector=_env("KSU_CAMERA_FRONT_LEFT_SELECTOR", "0"),
             width=int(_env("KSU_CAMERA_FRONT_LEFT_WIDTH", str(DEFAULT_WIDTH))),
             height=int(_env("KSU_CAMERA_FRONT_LEFT_HEIGHT", str(DEFAULT_HEIGHT))),
@@ -193,10 +194,11 @@ def default_camera_configs() -> Dict[str, CameraConfig]:
             ),
             enable_apriltag=_is_truthy_env("KSU_CAMERA_FRONT_LEFT_ENABLE_APRILTAG", "1"),
         ),
+        # USB camera, OpenCV index 1.
         "front_right": CameraConfig(
             name="front_right",
             label=_env("KSU_CAMERA_FRONT_RIGHT_LABEL", "Front Right"),
-            backend=_env("KSU_CAMERA_FRONT_RIGHT_BACKEND", "picamera2"),
+            backend=_env("KSU_CAMERA_FRONT_RIGHT_BACKEND", "opencv"),
             selector=_env("KSU_CAMERA_FRONT_RIGHT_SELECTOR", "1"),
             width=int(_env("KSU_CAMERA_FRONT_RIGHT_WIDTH", str(DEFAULT_WIDTH))),
             height=int(_env("KSU_CAMERA_FRONT_RIGHT_HEIGHT", str(DEFAULT_HEIGHT))),
@@ -206,14 +208,16 @@ def default_camera_configs() -> Dict[str, CameraConfig]:
             ),
             enable_apriltag=_is_truthy_env("KSU_CAMERA_FRONT_RIGHT_ENABLE_APRILTAG", "1"),
         ),
+        # Primary driver view — Pi camera on CSI connector 0.
+        # AprilTag annotation disabled: overlays are distracting for the driver.
         "driver": CameraConfig(
             name="driver",
             label=_env("KSU_CAMERA_DRIVER_LABEL", "Driver"),
-            backend=_env("KSU_CAMERA_DRIVER_BACKEND", "opencv"),
+            backend=_env("KSU_CAMERA_DRIVER_BACKEND", "picamera2"),
             selector=_env("KSU_CAMERA_DRIVER_SELECTOR", "0"),
             width=int(_env("KSU_CAMERA_DRIVER_WIDTH", str(DEFAULT_WIDTH))),
             height=int(_env("KSU_CAMERA_DRIVER_HEIGHT", str(DEFAULT_HEIGHT))),
-            calibration_file=_env("KSU_CAMERA_DRIVER_CALIBRATION_FILE", ""),
+            calibration_file=_env("KSU_CAMERA_DRIVER_CALIBRATION_FILE", shared_calibration),
             enable_apriltag=_is_truthy_env("KSU_CAMERA_DRIVER_ENABLE_APRILTAG", "0"),
         ),
     }
@@ -478,7 +482,7 @@ def render_root_page() -> bytes:
 </head>
 <body style="background:#111;color:#eee;font-family:sans-serif;">
     <h1>KSU Storm Multi-Camera Stream</h1>
-    <p>Ribbon cameras: front left + front right. USB camera: driver.</p>
+    <p>Driver cam (CSI connector 0): picamera2. USB cameras: front left + front right.</p>
     <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:16px;">
         {''.join(cards)}
     </div>

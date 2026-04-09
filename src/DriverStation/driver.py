@@ -22,6 +22,7 @@ for path in (LIB_DIR, UI_DIR):
         sys.path.insert(0, path_str)
 
 import comm
+import fms as fms_module
 from auto_routines import AUTO_ROUTINES, routine_description, routine_keys, routine_label, routine_payload
 from driver_ui import DriverUIHelpers
 
@@ -62,6 +63,26 @@ class AppWindow(DriverUIHelpers, QMainWindow):
         self.conn_manager = comm.ConnectionManager()
         self.conn_manager.signals.connection_status.connect(self.update_connection_status)
         self.conn_manager.start()
+
+        # Background command worker – all ZMQ sends happen here, never on the UI thread
+        self.cmd_worker = comm.CommandWorker(self.conn_manager)
+        self.cmd_worker.start()
+
+        # FMS poller
+        self.fms_required_voltage: float = 0.0  # current required voltage (0 = no match)
+        self.fms_required_rpm: float = 0.0      # current required RPM     (0 = no match)
+        self.fms_poller = fms_module.FMSPoller()
+        self.fms_poller.signals.connection_changed.connect(self._handle_fms_connection)
+        self.fms_poller.signals.match_update.connect(self._handle_fms_match_update)
+        self.fms_poller.signals.voltage_required.connect(self._on_fms_voltage_required)
+        self.fms_poller.signals.rpm_required.connect(self._on_fms_rpm_required)
+        self.fms_poller.start()
+
+        # Jumpstart cooldown timer (§3.3.5 — 30 s between jumpstarts)
+        self._jumpstart_cooldown_remaining: int = 0
+        self._jumpstart_cooldown_timer = QTimer(self)
+        self._jumpstart_cooldown_timer.setInterval(1000)  # tick every second
+        self._jumpstart_cooldown_timer.timeout.connect(self._tick_jumpstart_cooldown)
 
         # Telemetry receiver
         self.telemetry_receiver = comm.TelemetryReceiver(self.conn_manager)
@@ -120,6 +141,8 @@ class AppWindow(DriverUIHelpers, QMainWindow):
         self.btn_rst.clicked.connect(self.reset_robot)
         if hasattr(self, 'btn_auto_3'):
             self.btn_auto_3.clicked.connect(self.toggle_alliance)
+        if hasattr(self, 'jumpstart_btn'):
+            self.jumpstart_btn.clicked.connect(self.trigger_jumpstart)
         if hasattr(self, 'pushButton'):
             self.pushButton.clicked.connect(self.reset_odometry)
         if hasattr(self, 'odo_tab_reset_button'):
@@ -144,6 +167,38 @@ class AppWindow(DriverUIHelpers, QMainWindow):
             self.auto_run_selected_button.clicked.connect(self.run_selected_auto)
         if hasattr(self, "auto_cancel_button"):
             self.auto_cancel_button.clicked.connect(self.cancel_auto)
+
+        # Elevator PID controls
+        if hasattr(self, "elev_set_gains_btn"):
+            self.elev_set_gains_btn.clicked.connect(self.send_elevator_gains)
+        if hasattr(self, "elev_go_btn"):
+            self.elev_go_btn.clicked.connect(self.send_elevator_setpoint)
+        if hasattr(self, "elev_disable_btn"):
+            self.elev_disable_btn.clicked.connect(self.disable_elevator_pid)
+        if hasattr(self, "elev_preset_buttons"):
+            for label, btn in self.elev_preset_buttons.items():
+                ticks = btn.property("elev_ticks")
+                btn.clicked.connect(lambda checked, t=ticks: self._send_elevator_preset(t))
+        if hasattr(self, "elev_manual_send_btn"):
+            self.elev_manual_send_btn.clicked.connect(self.send_elevator_manual)
+        if hasattr(self, "elev_manual_stop_btn"):
+            self.elev_manual_stop_btn.clicked.connect(self.stop_elevator_manual)
+
+        # Arm PID controls
+        if hasattr(self, "arm_set_gains_btn"):
+            self.arm_set_gains_btn.clicked.connect(self.send_arm_gains)
+        if hasattr(self, "arm_go_btn"):
+            self.arm_go_btn.clicked.connect(self.send_arm_setpoint)
+        if hasattr(self, "arm_disable_btn"):
+            self.arm_disable_btn.clicked.connect(self.disable_arm_pid)
+        if hasattr(self, "arm_preset_buttons"):
+            for label, btn in self.arm_preset_buttons.items():
+                deg = btn.property("arm_degrees")
+                btn.clicked.connect(lambda checked, d=deg: self._send_arm_preset(d))
+        if hasattr(self, "arm_manual_send_btn"):
+            self.arm_manual_send_btn.clicked.connect(self.send_arm_manual)
+        if hasattr(self, "arm_manual_stop_btn"):
+            self.arm_manual_stop_btn.clicked.connect(self.stop_arm_manual)
         
         # Setup keyboard speed slider if it exists in UI
         if hasattr(self, 'keyboard_speed_slider'):
@@ -271,43 +326,35 @@ class AppWindow(DriverUIHelpers, QMainWindow):
             self.append_diagnostic("controls", "No auto routine selected")
             return False
 
-        client = self.conn_manager.get_client()
-        if not client:
+        if self.conn_manager.get_client() is None:
             self.append_diagnostic("controls", "Cannot run auto: robot not connected")
             return False
 
         try:
-            response = client.run_auto_routine(routine_payload(self.selected_auto_key))
+            payload = routine_payload(self.selected_auto_key)
         except KeyError as exc:
             logger.error("Unknown auto routine: %s", exc)
             self.append_diagnostic("controls", str(exc))
             return False
 
-        if not response or response.get("status") != "success":
-            self.append_diagnostic("controls", f"Failed to start auto: {routine_label(self.selected_auto_key)}")
-            return False
-
+        # Update UI immediately; robot confirms via telemetry.
         self.current_mode = "AUTO"
         self.robot_status.setText("Autonomous")
         self._update_odometry_context_labels()
-        self._update_auto_status_labels(response.get("auto"))
+        self._update_auto_status_labels({"active": True, "status": "running"})
         self.start_match_timer()
-        self.append_diagnostic("controls", f"Started auto routine: {routine_label(self.selected_auto_key)}")
+        self.append_diagnostic("controls", f"Auto routine requested: {routine_label(self.selected_auto_key)}")
+        self.cmd_worker.enqueue("auto_run", routine=payload)
         return True
 
     def cancel_auto(self):
-        client = self.conn_manager.get_client()
-        if not client:
+        if self.conn_manager.get_client() is None:
             self.append_diagnostic("controls", "Cannot cancel auto: robot not connected")
             return False
 
-        response = client.cancel_auto_routine()
-        if not response or response.get("status") != "success":
-            self.append_diagnostic("controls", "Failed to cancel auto routine")
-            return False
-
-        self._update_auto_status_labels(response.get("auto"))
-        self.append_diagnostic("controls", "Auto routine cancelled")
+        self._update_auto_status_labels({"active": False, "status": "cancelled"})
+        self.append_diagnostic("controls", "Auto routine cancel requested")
+        self.cmd_worker.enqueue("auto_cancel")
         return True
 
     def _sync_settings_tab_controls(self):
@@ -360,22 +407,161 @@ class AppWindow(DriverUIHelpers, QMainWindow):
                 f"Last Telemetry: {time.strftime('%H:%M:%S')}"
             )
 
+    # ── FMS handlers ──────────────────────────────────────────────────────────
+
+    def _handle_fms_connection(self, reachable: bool) -> None:
+        """Called when FMS reachability changes."""
+        if not hasattr(self, "fms_status_label"):
+            return
+        if reachable:
+            self.fms_status_label.setText("FMS: Connected")
+            self.fms_status_label.setStyleSheet("font-size: 12px; color: rgb(100, 220, 100);")
+        else:
+            self.fms_status_label.setText("FMS: Not connected")
+            self.fms_status_label.setStyleSheet("font-size: 12px; color: rgb(180, 180, 180);")
+            if hasattr(self, "fms_match_label"):
+                self.fms_match_label.setText("Match: --")
+            if hasattr(self, "fms_time_label"):
+                self.fms_time_label.setText("FMS Time: --")
+            if hasattr(self, "fms_voltage_label"):
+                self.fms_voltage_label.setText("--  V")
+            if hasattr(self, "fms_rpm_label"):
+                self.fms_rpm_label.setText("--  RPM")
+        self.append_diagnostic("connection", f"FMS reachable: {reachable}")
+
+    def _handle_fms_match_update(self, data) -> None:
+        """Called each poll cycle with fresh FMS data, or None if no active match."""
+        if data is None:
+            if hasattr(self, "fms_match_label"):
+                self.fms_match_label.setText("Match: No active match")
+            if hasattr(self, "fms_time_label"):
+                self.fms_time_label.setText("FMS Time: --")
+            if hasattr(self, "fms_voltage_label"):
+                self.fms_voltage_label.setText("--  V")
+            if hasattr(self, "fms_rpm_label"):
+                self.fms_rpm_label.setText("--  RPM")
+            return
+
+        # data is an fms_module.FMSMatchData instance
+        status = "Active" if data.match_active else "Upcoming"
+        if hasattr(self, "fms_match_label"):
+            self.fms_match_label.setText(f"Match: {status}")
+
+        mins = int(data.time_remaining_s) // 60
+        secs = int(data.time_remaining_s) % 60
+        if hasattr(self, "fms_time_label"):
+            self.fms_time_label.setText(f"FMS Time: {mins}:{secs:02d}")
+
+        voltage = data.required_voltage
+        if hasattr(self, "fms_voltage_label"):
+            if voltage > 0:
+                self.fms_voltage_label.setText(f"{voltage:.0f}  V")
+            else:
+                self.fms_voltage_label.setText("--  V")
+
+        rpm = data.required_rpm
+        if hasattr(self, "fms_rpm_label"):
+            if rpm > 0:
+                self.fms_rpm_label.setText(f"{rpm:.0f}  RPM")
+            else:
+                self.fms_rpm_label.setText("--  RPM")
+
+    def _on_fms_voltage_required(self, voltage: float) -> None:
+        """Called only when the required voltage value actually changes.
+
+        This is the integration point for the voltage circuit.  When the
+        circuit hardware and wiring specs are available, send the voltage
+        command here (e.g. via SerialBridge).
+
+        Args:
+            voltage: Required voltage in volts (2 / 4 / 6 / 8 / 10), or 0
+                     when no match is active.
+        """
+        self.fms_required_voltage = voltage
+        logger.info("FMS voltage required: %sV", voltage)
+        self.append_diagnostic("connection", f"FMS voltage required: {voltage}V")
+
+        # ── future circuit integration ──────────────────────────────────────
+        # Fill in once circuit specs/wiring are available:
+        #
+        #   if voltage > 0 and hasattr(self, "serial_bridge"):
+        #       self.serial_bridge.send_voltage(voltage)
+        # ───────────────────────────────────────────────────────────────────
+
+    def _on_fms_rpm_required(self, rpm: float) -> None:
+        """Called only when the required grid frequency (RPM) changes.
+
+        Operators use this to know how fast to spin the Charging Wheel
+        (§3.3.4 Generate Electricity: 1 KJ per 2s at correct RPM ±5).
+
+        Args:
+            rpm: Required RPM (20 / 30 / 40 / 50), or 0 when no match active.
+        """
+        self.fms_required_rpm = rpm
+        logger.info("FMS RPM required: %s RPM", rpm)
+        self.append_diagnostic("connection", f"FMS grid frequency: {rpm} RPM")
+
+    # ── Jumpstart cooldown ────────────────────────────────────────────────────
+
+    JUMPSTART_COOLDOWN_S = 30
+
+    def trigger_jumpstart(self) -> None:
+        """Start a 30-second cooldown after a Jumpstart Grid attempt (§3.3.5)."""
+        if self._jumpstart_cooldown_remaining > 0:
+            self.append_diagnostic("controls",
+                f"Jumpstart blocked — cooldown {self._jumpstart_cooldown_remaining}s remaining")
+            return
+
+        self._jumpstart_cooldown_remaining = self.JUMPSTART_COOLDOWN_S
+        self._update_jumpstart_ui()
+        self._jumpstart_cooldown_timer.start()
+        self.append_diagnostic("controls", "Jumpstart triggered — 30 s cooldown started")
+
+    def _tick_jumpstart_cooldown(self) -> None:
+        self._jumpstart_cooldown_remaining -= 1
+        if self._jumpstart_cooldown_remaining <= 0:
+            self._jumpstart_cooldown_remaining = 0
+            self._jumpstart_cooldown_timer.stop()
+            self._end_jumpstart_cooldown()
+        else:
+            self._update_jumpstart_ui()
+
+    def _update_jumpstart_ui(self) -> None:
+        remaining = self._jumpstart_cooldown_remaining
+        if hasattr(self, "jumpstart_cooldown_label"):
+            self.jumpstart_cooldown_label.setText(f"COOLDOWN  {remaining} s")
+        if hasattr(self, "voltage_stack"):
+            self.voltage_stack.setCurrentIndex(1)  # show cooldown overlay
+        if hasattr(self, "jumpstart_btn"):
+            self.jumpstart_btn.setEnabled(False)
+            self.jumpstart_btn.setStyleSheet(
+                "font-weight: bold; font-size: 13px;"
+                "background: rgb(80, 40, 40); color: rgb(160, 100, 100); border-radius: 4px;"
+            )
+
+    def _end_jumpstart_cooldown(self) -> None:
+        if hasattr(self, "voltage_stack"):
+            self.voltage_stack.setCurrentIndex(0)  # restore voltage display
+        if hasattr(self, "jumpstart_btn"):
+            self.jumpstart_btn.setEnabled(True)
+            self.jumpstart_btn.setStyleSheet(
+                "font-weight: bold; font-size: 13px;"
+                "background: rgb(60, 130, 60); color: white; border-radius: 4px;"
+            )
+        self.append_diagnostic("controls", "Jumpstart cooldown expired — ready")
+
+    # ── end FMS handlers ──────────────────────────────────────────────────────
+
     def set_alliance(self, alliance):
         alliance = str(alliance).upper()
         if alliance not in {"RED", "BLUE"}:
             return False
 
-        client = self.conn_manager.get_client()
-        if client:
-            response = client.send_command("alliance", alliance=alliance)
-            if not response or response.get("status") != "success":
-                logger.warning(f"Failed to set alliance: {alliance}")
-                self.append_diagnostic("controls", f"Failed to set alliance: {alliance}")
-                return False
-
         self.current_alliance = alliance
         self._update_alliance_button()
         self.append_diagnostic("controls", f"Alliance set to {alliance}")
+        if self.conn_manager.get_client() is not None:
+            self.cmd_worker.enqueue("alliance", alliance=alliance)
         return True
 
     def toggle_alliance(self):
@@ -466,27 +652,121 @@ class AppWindow(DriverUIHelpers, QMainWindow):
 
     def set_odometry_mode(self, mode):
         """Set the odometry source mode on the robot."""
-        client = self.conn_manager.get_client()
-        if client:
-            response = client.send_command('odometry_mode', mode=mode)
-            if response and response.get('status') == 'success':
-                if hasattr(self, 'label_odo_mode'):
-                    self.label_odo_mode.setText(f"Odometry Mode: {mode.title()}")
-                if hasattr(self, 'odo_tab_odo_mode_label'):
-                    self.odo_tab_odo_mode_label.setText(f"Odometry Mode: {mode.title()}")
-                self.append_diagnostic("telemetry", f"Odometry mode set to {mode}")
-            else:
-                logger.warning(f"Failed to set odometry mode: {mode}")
-                self.append_diagnostic("telemetry", f"Failed to set odometry mode: {mode}")
+        if hasattr(self, 'label_odo_mode'):
+            self.label_odo_mode.setText(f"Odometry Mode: {mode.title()}")
+        if hasattr(self, 'odo_tab_odo_mode_label'):
+            self.odo_tab_odo_mode_label.setText(f"Odometry Mode: {mode.title()}")
+        self.append_diagnostic("telemetry", f"Odometry mode requested: {mode}")
+        if self.conn_manager.get_client() is not None:
+            self.cmd_worker.enqueue("odometry_mode", mode=mode)
+
+    def send_elevator_gains(self):
+        kp = self.elev_kp_spin.value()
+        ki = self.elev_ki_spin.value()
+        kd = self.elev_kd_spin.value()
+        max_out = self.elev_max_out_spin.value()
+        decel_zone = self.elev_decel_zone_spin.value()
+        self.append_diagnostic("telemetry",
+            f"Elevator PID gains: kP={kp} kI={ki} kD={kd} maxOut={max_out} decelZone={decel_zone}")
+        if self.conn_manager.get_client() is not None:
+            self.cmd_worker.enqueue("elevator_pid", kp=kp, ki=ki, kd=kd,
+                                    max_output=max_out, decel_zone=decel_zone)
+
+    def send_elevator_setpoint(self):
+        ticks = self.elev_setpoint_spin.value()
+        self._send_elevator_preset(ticks)
+
+    def _send_elevator_preset(self, ticks: int):
+        self.elev_setpoint_spin.setValue(ticks)
+        self.append_diagnostic("telemetry", f"Elevator setpoint: {ticks} ticks")
+        if self.conn_manager.get_client() is not None:
+            self.cmd_worker.enqueue("elevator_setpoint", setpoint=float(ticks))
+        if hasattr(self, "elev_setpoint_label"):
+            self.elev_setpoint_label.setText(f"Setpoint: {ticks}")
+        if hasattr(self, "elev_status_label"):
+            self.elev_status_label.setText("PID: Active")
+
+    def send_elevator_manual(self):
+        left = self.elev_manual_left_slider.value() / 100.0
+        right = self.elev_manual_right_slider.value() / 100.0
+        self.append_diagnostic("telemetry", f"Elevator manual: L={left:.2f} R={right:.2f}")
+        if self.conn_manager.get_client() is not None:
+            self.cmd_worker.enqueue("elevator_manual", left=left, right=right)
+        if hasattr(self, "elev_status_label"):
+            self.elev_status_label.setText("PID: Inactive (manual)")
+
+    def stop_elevator_manual(self):
+        if hasattr(self, "elev_manual_left_slider"):
+            self.elev_manual_left_slider.setValue(0)
+        if hasattr(self, "elev_manual_right_slider"):
+            self.elev_manual_right_slider.setValue(0)
+        self.append_diagnostic("telemetry", "Elevator manual stop")
+        if self.conn_manager.get_client() is not None:
+            self.cmd_worker.enqueue("elevator_manual", left=0.0, right=0.0)
+
+    def disable_elevator_pid(self):
+        self.append_diagnostic("telemetry", "Elevator PID disabled")
+        if self.conn_manager.get_client() is not None:
+            self.cmd_worker.enqueue("elevator_disable")
+        if hasattr(self, "elev_status_label"):
+            self.elev_status_label.setText("PID: Inactive")
+
+    # ── Arm PID controls ──────────────────────────────────────────────────────
+
+    def send_arm_gains(self):
+        kp = self.arm_kp_spin.value()
+        ki = self.arm_ki_spin.value()
+        kd = self.arm_kd_spin.value()
+        max_out = self.arm_max_out_spin.value()
+        decel_zone = self.arm_decel_zone_spin.value()
+        self.append_diagnostic("telemetry",
+            f"Arm PID gains: kP={kp} kI={ki} kD={kd} maxOut={max_out} decelZone={decel_zone}°")
+        if self.conn_manager.get_client() is not None:
+            self.cmd_worker.enqueue("arm_pid", kp=kp, ki=ki, kd=kd,
+                                    max_output=max_out, decel_zone_deg=decel_zone)
+
+    def send_arm_setpoint(self):
+        deg = self.arm_setpoint_spin.value()
+        self._send_arm_preset(deg)
+
+    def _send_arm_preset(self, degrees: float):
+        self.arm_setpoint_spin.setValue(degrees)
+        self.append_diagnostic("telemetry", f"Arm setpoint: {degrees:.1f}°")
+        if self.conn_manager.get_client() is not None:
+            self.cmd_worker.enqueue("arm_setpoint", degrees=float(degrees))
+        if hasattr(self, "arm_setpoint_label"):
+            self.arm_setpoint_label.setText(f"Setpoint: {degrees:.1f}°")
+        if hasattr(self, "arm_status_label"):
+            self.arm_status_label.setText("PID: Active")
+
+    def send_arm_manual(self):
+        speed = self.arm_manual_slider.value() / 100.0
+        self.append_diagnostic("telemetry", f"Arm manual: speed={speed:.2f}")
+        if self.conn_manager.get_client() is not None:
+            self.cmd_worker.enqueue("arm_manual", speed=speed)
+        if hasattr(self, "arm_status_label"):
+            self.arm_status_label.setText("PID: Inactive (manual)")
+
+    def stop_arm_manual(self):
+        if hasattr(self, "arm_manual_slider"):
+            self.arm_manual_slider.setValue(0)
+        self.append_diagnostic("telemetry", "Arm manual stop")
+        if self.conn_manager.get_client() is not None:
+            self.cmd_worker.enqueue("arm_manual", speed=0.0)
+
+    def disable_arm_pid(self):
+        self.append_diagnostic("telemetry", "Arm PID disabled")
+        if self.conn_manager.get_client() is not None:
+            self.cmd_worker.enqueue("arm_disable")
+        if hasattr(self, "arm_status_label"):
+            self.arm_status_label.setText("PID: Inactive")
 
     def reset_odometry(self):
         """Reset odometry pose on robot and local field widget."""
-        client = self.conn_manager.get_client()
-        if client:
-            response = client.send_command('reset_odometry')
-            if response and response.get('status') == 'success':
-                logger.info("Odometry reset requested")
-                self.append_diagnostic("telemetry", "Odometry reset requested")
+        logger.info("Odometry reset requested")
+        self.append_diagnostic("telemetry", "Odometry reset requested")
+        if self.conn_manager.get_client() is not None:
+            self.cmd_worker.enqueue("reset_odometry")
         start_x, start_y, start_theta = self._alliance_start_pose()
         self.current_pose = {"x": start_x, "y": start_y, "theta_deg": start_theta}
         self.expected_pose = self.current_pose.copy()
@@ -522,29 +802,22 @@ class AppWindow(DriverUIHelpers, QMainWindow):
     
     def reset_robot(self):
         """Reset robot to stopped state."""
-        client = self.conn_manager.get_client()
-        if client:
-            client.reset_robot()
-            self.current_mode = "STOPPED"
-            self.robot_status.setText("Stopped")
-            self._update_auto_status_labels({"active": False, "status": "idle"})
-            self.stop_match_timer()
-            logger.info("Robot reset")
-            self.append_diagnostic("controls", "Robot reset requested")
+        self.current_mode = "STOPPED"
+        self.robot_status.setText("Stopped")
+        self._update_auto_status_labels({"active": False, "status": "idle"})
+        self.stop_match_timer()
+        logger.info("Robot reset")
+        self.append_diagnostic("controls", "Robot reset requested")
+        if self.conn_manager.get_client() is not None:
+            self.cmd_worker.enqueue("reset")
 
     def _set_robot_mode(self, mode):
         mode = str(mode).upper()
-        client = self.conn_manager.get_client()
-        if not client:
+        if self.conn_manager.get_client() is None:
             return False
 
-        response = client.set_mode(mode)
-        if not response or response.get("status") != "success":
-            logger.warning(f"Failed to set mode: {mode}")
-            return False
-
+        # Update UI immediately; robot confirms via telemetry.
         self.current_mode = mode
-        self.append_diagnostic("controls", f"Robot mode acknowledged: {mode}")
         if mode == "AUTO":
             self.robot_status.setText("Autonomous")
         elif mode == "TELEOP":
@@ -553,6 +826,9 @@ class AppWindow(DriverUIHelpers, QMainWindow):
             self.robot_status.setText("Stopped")
             self._update_auto_status_labels({"active": False, "status": "idle"})
         self._update_odometry_context_labels()
+        self.append_diagnostic("controls", f"Mode requested: {mode}")
+
+        self.cmd_worker.enqueue("mode", mode=mode)
         return True
 
     def _set_control_mode_label(self, mode_name, color=None):
@@ -689,6 +965,14 @@ class AppWindow(DriverUIHelpers, QMainWindow):
                 self._update_auto_status_labels(auto_status)
             self._update_odometry_context_labels()
             self._update_network_telemetry_labels(data)
+
+            elevator = data.get("elevator")
+            if elevator is not None:
+                self._update_elevator_labels(elevator, encoders)
+
+            arm = data.get("arm")
+            if arm is not None:
+                self._update_arm_labels(arm)
         except Exception as e:
             logger.error(f"Error parsing telemetry pose: {e}")
             self.append_diagnostic("telemetry", f"Telemetry parse error: {e}")
@@ -699,6 +983,36 @@ class AppWindow(DriverUIHelpers, QMainWindow):
             self.append_diagnostic_json("telemetry", "Telemetry update", data)
             self._last_diagnostic_telemetry_time = now
     
+    def _update_elevator_labels(self, elevator: dict, encoders: list):
+        active = elevator.get("active", False)
+        setpoint = elevator.get("setpoint", 0)
+        current = elevator.get("current_pos", 0.0)
+        output = elevator.get("output", 0.0)
+
+        if hasattr(self, "elev_status_label"):
+            self.elev_status_label.setText("PID: Active" if active else "PID: Inactive")
+        if hasattr(self, "elev_position_label"):
+            self.elev_position_label.setText(f"Position: {current:.0f}")
+        if hasattr(self, "elev_setpoint_label"):
+            self.elev_setpoint_label.setText(f"Setpoint: {setpoint:.0f}")
+        if hasattr(self, "elev_output_label"):
+            self.elev_output_label.setText(f"Output: {output:.3f}")
+
+    def _update_arm_labels(self, arm: dict):
+        active = arm.get("active", False)
+        current = arm.get("current_deg", 0.0)
+        setpoint = arm.get("setpoint_deg", 0.0)
+        output = arm.get("output", 0.0)
+
+        if hasattr(self, "arm_status_label"):
+            self.arm_status_label.setText("PID: Active" if active else "PID: Inactive")
+        if hasattr(self, "arm_position_label"):
+            self.arm_position_label.setText(f"Position: {current:.1f}°")
+        if hasattr(self, "arm_setpoint_label"):
+            self.arm_setpoint_label.setText(f"Setpoint: {setpoint:.1f}°")
+        if hasattr(self, "arm_output_label"):
+            self.arm_output_label.setText(f"Output: {output:.3f}")
+
     def update_keyboard_speed(self, value):
         """Update keyboard speed from slider."""
         self.keyboard_speed = value / 100.0
@@ -838,8 +1152,9 @@ class AppWindow(DriverUIHelpers, QMainWindow):
 
     def poll_gamepad(self):
         """Poll gamepad state and send updates to robot."""
-        client = self.conn_manager.get_client()
-        if not client:
+        # Only check connection status – never block on ZMQ here.
+        is_connected = self.conn_manager.get_client() is not None
+        if not is_connected:
             return
 
         try:
@@ -875,15 +1190,14 @@ class AppWindow(DriverUIHelpers, QMainWindow):
                 self.joystick_values['rx'] = axis_rx if abs(axis_rx) > AXIS_DEADZONE else 0.0
                 self.joystick_values['ry'] = -axis_ry if abs(axis_ry) > AXIS_DEADZONE else 0.0
 
-                # Handle button events
+                # Handle button events – enqueue, never block
                 for event in pygame.event.get():
                     if event.type == pygame.JOYBUTTONDOWN:
-                        client.send_button(event.button, "DOWN")
+                        self.cmd_worker.enqueue("button", button_id=event.button, action="DOWN")
                         if event.button in FACE_BUTTON_COLORS:
                             self._set_face_button_style(event.button, active=True)
-                            
                     elif event.type == pygame.JOYBUTTONUP:
-                        client.send_button(event.button, "UP")
+                        self.cmd_worker.enqueue("button", button_id=event.button, action="UP")
                         if event.button in FACE_BUTTON_COLORS:
                             self._set_face_button_style(event.button, active=False)
             else:
@@ -925,9 +1239,9 @@ class AppWindow(DriverUIHelpers, QMainWindow):
                 or self.values_changed_significantly(self.last_sent_joystick_values, self.joystick_values)
             )
 
-            # Keep the temporary coprocessor watchdog fed during teleop by streaming commands continuously.
+            # Keep the coprocessor watchdog fed – enqueue so the UI never blocks.
             if should_send_joystick:
-                client.send_joystick(
+                self.cmd_worker.send_joystick(
                     self.joystick_values['lx'],
                     self.joystick_values['ly'],
                     self.joystick_values['rx'],

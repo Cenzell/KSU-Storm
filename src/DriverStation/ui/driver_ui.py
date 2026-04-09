@@ -9,7 +9,13 @@ from dataclasses import dataclass
 from pathlib import Path
 import numpy as np
 
-from PyQt6.QtWidgets import QWidget, QVBoxLayout, QTabWidget, QLabel, QGridLayout, QGroupBox, QPlainTextEdit, QPushButton, QHBoxLayout, QSizePolicy, QSlider, QCheckBox, QComboBox
+from PyQt6.QtWidgets import (
+    QWidget, QVBoxLayout, QTabWidget, QLabel, QGridLayout, QGroupBox,
+    QPlainTextEdit, QPushButton, QHBoxLayout, QSizePolicy, QSlider,
+    QCheckBox, QComboBox, QSpinBox, QDoubleSpinBox, QScrollArea, QFrame,
+    QTableWidget, QTableWidgetItem, QHeaderView, QLineEdit, QSplitter,
+    QAbstractItemView,
+)
 from PyQt6.QtCore import Qt, QPointF, QRectF, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor, QPainter, QPen, QBrush, QPolygonF, QImage, QPixmap
 
@@ -17,6 +23,18 @@ try:
     import cv2
 except ImportError:
     cv2 = None
+
+try:
+    from match_history import MatchHistory, MatchResult, calculate_score
+except ImportError:
+    try:
+        import sys as _sys
+        _sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+        from match_history import MatchHistory, MatchResult, calculate_score
+    except ImportError:
+        MatchHistory = None
+        MatchResult = None
+        calculate_score = None
 
 logger = logging.getLogger(__name__)
 
@@ -92,10 +110,14 @@ def missing_opencv_message() -> str:
 
 class FieldWidget(QWidget):
     """Simple 2D field map showing robot position and heading."""
+    # Power Flash field: 16ft x 8ft (§2, §8.1)
+    FIELD_WIDTH_M = 16 * 0.3048    # 4.877 m
+    FIELD_HEIGHT_M = 8 * 0.3048    # 2.438 m
+
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.field_width_m = 3.6
-        self.field_height_m = 3.6
+        self.field_width_m = self.FIELD_WIDTH_M
+        self.field_height_m = self.FIELD_HEIGHT_M
         self.robot_x_m = self.field_width_m / 2.0
         self.robot_y_m = self.field_height_m / 2.0
         self.robot_theta_deg = 0.0
@@ -384,60 +406,99 @@ class DriverUIHelpers:
         self.setup_settings_tab()
         self.setup_network_tab()
         self.setup_odometry_tab()
+        self.setup_mechanism_tab()
         self.setup_diagnostics_tab()
+        self.setup_score_tab()
+        self.setup_match_history_tab()
         self.main_tabs.currentChanged.connect(self._handle_tab_changed)
         self._camera_render_timer.start()
 
     def _panel_style(self):
         return (
-            "QFrame, QGroupBox {"
+            "QGroupBox {"
             "background-color: rgb(18, 24, 30);"
             "border: 1px solid rgb(55, 100, 102);"
-            "border-radius: 10px;"
+            "border-radius: 8px;"
+            "margin-top: 18px;"
+            "padding-top: 4px;"
             "}"
-            "QLabel { color: rgb(225, 232, 236); }"
+            "QGroupBox::title {"
+            "subcontrol-origin: margin;"
+            "subcontrol-position: top left;"
+            "padding: 2px 8px;"
+            "color: rgb(130, 190, 200);"
+            "font-weight: bold;"
+            "font-size: 12px;"
+            "}"
+            "QWidget { background-color: transparent; color: rgb(220, 228, 234); }"
+            "QLabel { color: rgb(220, 228, 234); background: transparent; border: none; }"
+            "QCheckBox { color: rgb(220, 228, 234); background: transparent; border: none; }"
             "QPushButton {"
             "background-color: rgb(37, 54, 64);"
             "color: rgb(240, 245, 247);"
             "border: 1px solid rgb(77, 122, 126);"
-            "border-radius: 8px;"
-            "padding: 6px 10px;"
+            "border-radius: 6px;"
+            "padding: 5px 10px;"
             "}"
             "QPushButton:hover { background-color: rgb(49, 70, 82); }"
+            "QPushButton:pressed { background-color: rgb(28, 42, 52); }"
             "QComboBox {"
             "background-color: rgb(37, 54, 64);"
             "color: rgb(240, 245, 247);"
             "border: 1px solid rgb(77, 122, 126);"
-            "border-radius: 8px;"
-            "padding: 6px 10px;"
+            "border-radius: 6px;"
+            "padding: 4px 8px;"
             "}"
+            "QComboBox::drop-down { border: none; }"
+            "QComboBox QAbstractItemView {"
+            "background-color: rgb(30, 42, 52);"
+            "color: rgb(220, 228, 234);"
+            "selection-background-color: rgb(55, 85, 100);"
+            "}"
+            "QPlainTextEdit {"
+            "background-color: rgb(13, 18, 23);"
+            "color: rgb(210, 220, 225);"
+            "border: 1px solid rgb(45, 80, 85);"
+            "border-radius: 4px;"
+            "}"
+            "QSlider::groove:horizontal {"
+            "background: rgb(40, 55, 65);"
+            "height: 6px; border-radius: 3px;"
+            "}"
+            "QSlider::handle:horizontal {"
+            "background: rgb(77, 140, 150);"
+            "width: 14px; height: 14px;"
+            "border-radius: 7px; margin: -4px 0;"
+            "}"
+            "QTabWidget { background: transparent; border: none; }"
             "QTabWidget::pane {"
             "border: 1px solid rgb(55, 100, 102);"
-            "background-color: rgb(14, 19, 24);"
-            "border-radius: 8px;"
+            "background-color: rgb(13, 18, 23);"
+            "border-radius: 6px;"
             "top: -1px;"
             "}"
             "QTabBar::tab {"
-            "background-color: rgb(24, 32, 40);"
-            "color: rgb(210, 220, 226);"
-            "border: 1px solid rgb(55, 100, 102);"
-            "padding: 6px 12px;"
-            "margin-right: 4px;"
-            "border-top-left-radius: 8px;"
-            "border-top-right-radius: 8px;"
+            "background-color: rgb(22, 30, 38);"
+            "color: rgb(180, 195, 205);"
+            "border: 1px solid rgb(45, 80, 85);"
+            "padding: 5px 14px;"
+            "margin-right: 3px;"
+            "border-top-left-radius: 6px;"
+            "border-top-right-radius: 6px;"
             "}"
             "QTabBar::tab:selected {"
             "background-color: rgb(37, 54, 64);"
             "color: rgb(240, 245, 247);"
+            "border-bottom-color: rgb(13, 18, 23);"
             "}"
-            "QTabBar::tab:hover { background-color: rgb(44, 63, 74); }"
+            "QTabBar::tab:hover { background-color: rgb(32, 46, 58); }"
         )
 
     def setup_main_page_layout(self):
         self.frame.setStyleSheet("background-color: rgb(11, 16, 20);")
         existing_layout = self.frame.layout()
         if existing_layout is None:
-            root_layout = QGridLayout(self.frame)
+            root_layout = QHBoxLayout(self.frame)
         else:
             root_layout = existing_layout
             while root_layout.count():
@@ -445,136 +506,224 @@ class DriverUIHelpers:
                 widget = item.widget()
                 if widget is not None:
                     widget.setParent(None)
-        root_layout.setContentsMargins(12, 12, 12, 12)
-        root_layout.setHorizontalSpacing(12)
-        root_layout.setVerticalSpacing(12)
+        root_layout.setContentsMargins(10, 10, 10, 10)
+        root_layout.setSpacing(10)
 
         # Hide the original geometry-based containers so they do not sit on top of
         # the rebuilt dashboard and steal mouse events.
-        legacy_panels = [
-            "frame_connection",
-            "frame_robot_control",
-            "frame_connection_2",
-            "frame_connection_3",
-            "frame_keyboard",
-        ]
-        for name in legacy_panels:
+        for name in ("frame_connection", "frame_robot_control", "frame_connection_2",
+                      "frame_connection_3", "frame_keyboard"):
             panel = getattr(self, name, None)
             if panel is not None:
                 panel.hide()
 
-        left_column = QWidget(self.frame)
-        left_layout = QVBoxLayout(left_column)
+        # ── LEFT SIDEBAR ──────────────────────────────────────────────────────
+        left_sidebar = QWidget(self.frame)
+        left_sidebar.setFixedWidth(260)
+        left_sidebar.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
+        left_layout = QVBoxLayout(left_sidebar)
         left_layout.setContentsMargins(0, 0, 0, 0)
-        left_layout.setSpacing(12)
+        left_layout.setSpacing(8)
 
-        status_group = QGroupBox("Connection")
-        status_layout = QVBoxLayout(status_group)
-        for widget in (
-            self.status_label,
-            self.address_label,
-            self.ping_label,
-            self.gamepad_label,
-            self.control_mode_label,
-        ):
-            status_layout.addWidget(widget)
-        buttons_row = QHBoxLayout()
-        buttons_row.setSpacing(8)
-        for widget in (
-            self.button_b_label,
-            self.button_y_label,
-            self.button_a_label,
-            self.button_x_label,
-        ):
-            buttons_row.addWidget(widget)
-        status_layout.addLayout(buttons_row)
-        axes_row = QHBoxLayout()
-        axes_row.setSpacing(8)
-        for widget in (
-            self.lx_label,
-            self.rx_label,
-            self.ly_label,
-            self.ry_label,
-        ):
-            axes_row.addWidget(widget)
-        status_layout.addLayout(axes_row)
-        left_layout.addWidget(status_group)
+        # Connection info
+        conn_group = QGroupBox("Connection")
+        conn_layout = QVBoxLayout(conn_group)
+        conn_layout.setSpacing(4)
+        for widget in (self.status_label, self.address_label, self.ping_label,
+                       self.control_mode_label):
+            widget.setStyleSheet("font-size: 12px;")
+            conn_layout.addWidget(widget)
+        left_layout.addWidget(conn_group)
 
-        options_group = QGroupBox("Options")
-        options_layout = QVBoxLayout(options_group)
-        for widget in (
-            self.end_after_teleop,
-            self.slow_drive,
-            self.only_drive,
-            self.disable_drive,
-            self.disable_vision,
-            self.check_odo,
-            self.checkBox,
-        ):
-            options_layout.addWidget(widget)
-        options_layout.addStretch(1)
-        left_layout.addWidget(options_group)
+        # Robot control buttons
+        ctrl_group = QGroupBox("Robot Control")
+        ctrl_layout = QVBoxLayout(ctrl_group)
+        ctrl_layout.setSpacing(6)
 
-        odometry_group = QGroupBox("Odometry Controls")
-        odometry_layout = QVBoxLayout(odometry_group)
-        odometry_layout.addWidget(self.label_odo_mode)
-        pose_row = QHBoxLayout()
-        for widget in (self.label_3, self.label_2, self.label_4):
-            pose_row.addWidget(widget)
-        odometry_layout.addLayout(pose_row)
+        # Status + timer row
+        status_row = QHBoxLayout()
+        self.robot_status.setStyleSheet("font-size: 13px; font-weight: bold; color: rgb(240, 200, 80);")
+        self.timer.setStyleSheet("font-size: 13px; font-weight: bold; color: rgb(140, 210, 240);")
+        status_row.addWidget(self.robot_status, 1)
+        status_row.addWidget(self.timer)
+        ctrl_layout.addLayout(status_row)
+
+        # Mode buttons row
         mode_row = QHBoxLayout()
-        for widget in (self.btn_odo_optical, self.btn_odo_motor, self.btn_odo_hybrid):
-            mode_row.addWidget(widget)
-        odometry_layout.addLayout(mode_row)
-        odometry_layout.addWidget(self.pushButton)
-        odometry_layout.addStretch(1)
-        left_layout.addWidget(odometry_group, 1)
+        mode_row.setSpacing(6)
+        self.btn_auto.setMinimumHeight(36)
+        self.btn_auto.setStyleSheet(
+            "QPushButton { background-color: rgb(40, 80, 40); color: white; border: 1px solid rgb(60, 120, 60);"
+            "border-radius: 6px; font-weight: bold; font-size: 13px; }"
+            "QPushButton:hover { background-color: rgb(55, 110, 55); }"
+            "QPushButton:pressed { background-color: rgb(30, 60, 30); }")
+        self.btn_teleop.setMinimumHeight(36)
+        self.btn_teleop.setStyleSheet(
+            "QPushButton { background-color: rgb(30, 60, 110); color: white; border: 1px solid rgb(50, 90, 160);"
+            "border-radius: 6px; font-weight: bold; font-size: 13px; }"
+            "QPushButton:hover { background-color: rgb(40, 80, 150); }"
+            "QPushButton:pressed { background-color: rgb(20, 45, 85); }")
+        self.btn_rst.setMinimumHeight(36)
+        self.btn_rst.setStyleSheet(
+            "QPushButton { background-color: rgb(110, 30, 30); color: white; border: 1px solid rgb(160, 50, 50);"
+            "border-radius: 6px; font-weight: bold; font-size: 13px; }"
+            "QPushButton:hover { background-color: rgb(150, 40, 40); }"
+            "QPushButton:pressed { background-color: rgb(80, 20, 20); }")
+        mode_row.addWidget(self.btn_auto)
+        mode_row.addWidget(self.btn_teleop)
+        mode_row.addWidget(self.btn_rst)
+        ctrl_layout.addLayout(mode_row)
 
-        center_column = QWidget(self.frame)
-        center_layout = QVBoxLayout(center_column)
-        center_layout.setContentsMargins(0, 0, 0, 0)
-        center_layout.setSpacing(12)
+        # Alliance row (keep existing button)
+        alliance_row = QHBoxLayout()
+        alliance_row.setSpacing(6)
+        self.btn_auto_3.setMinimumHeight(28)
+        alliance_row.addWidget(self.btn_auto_3)
+        ctrl_layout.addLayout(alliance_row)
+        left_layout.addWidget(ctrl_group)
 
-        control_group = QGroupBox("Robot Control")
-        control_layout = QGridLayout(control_group)
-        control_layout.addWidget(self.label, 0, 0)
-        control_layout.addWidget(self.robot_status, 0, 1)
-        control_layout.addWidget(self.timer, 0, 2)
-        control_layout.addWidget(self.btn_auto, 1, 0)
-        control_layout.addWidget(self.btn_teleop, 1, 1)
-        control_layout.addWidget(self.btn_rst, 1, 2)
-        control_layout.addWidget(self.btn_auto_2, 2, 0)
-        control_layout.addWidget(self.btn_auto_3, 2, 1, 1, 2)
+        # FMS status panel
+        fms_group = QGroupBox("Field Management System")
+        fms_layout = QVBoxLayout(fms_group)
+        fms_layout.setSpacing(4)
+
+        self.fms_status_label = QLabel("FMS: Not connected")
+        self.fms_status_label.setStyleSheet("font-size: 12px;")
+        fms_layout.addWidget(self.fms_status_label)
+
+        self.fms_match_label = QLabel("Match: No active match")
+        self.fms_match_label.setStyleSheet("font-size: 12px;")
+        fms_layout.addWidget(self.fms_match_label)
+
+        self.fms_time_label = QLabel("FMS Time: --")
+        self.fms_time_label.setStyleSheet("font-size: 12px;")
+        fms_layout.addWidget(self.fms_time_label)
+
+        # Voltage display — prominent, drives the circuit (§3.3.5 Jumpstart the Grid)
+        voltage_row = QHBoxLayout()
+        voltage_row.setSpacing(6)
+        voltage_lbl = QLabel("Grid Voltage:")
+        voltage_lbl.setStyleSheet("font-size: 12px;")
+
+        # QStackedWidget: page 0 = normal voltage, page 1 = 30s cooldown overlay
+        from PyQt6.QtWidgets import QStackedWidget
+        self.voltage_stack = QStackedWidget()
+        self.voltage_stack.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+
+        self.fms_voltage_label = QLabel("--  V")
+        self.fms_voltage_label.setStyleSheet(
+            "font-size: 18px; font-weight: bold; color: rgb(140, 210, 240);"
+        )
+        self.fms_voltage_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.voltage_stack.addWidget(self.fms_voltage_label)   # index 0
+
+        self.jumpstart_cooldown_label = QLabel("COOLDOWN  30 s")
+        self.jumpstart_cooldown_label.setStyleSheet(
+            "font-size: 18px; font-weight: bold; color: rgb(255, 80, 60);"
+            "background: rgba(120, 30, 20, 180); border-radius: 4px; padding: 1px 6px;"
+        )
+        self.jumpstart_cooldown_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.voltage_stack.addWidget(self.jumpstart_cooldown_label)   # index 1
+
+        voltage_row.addWidget(voltage_lbl)
+        voltage_row.addWidget(self.voltage_stack, 1)
+        fms_layout.addLayout(voltage_row)
+
+        # Jumpstart button — triggers the 30 s cooldown overlay (§3.3.5)
+        self.jumpstart_btn = QPushButton("Jumpstart Grid")
+        self.jumpstart_btn.setObjectName("jumpstart_btn")
+        self.jumpstart_btn.setMinimumHeight(30)
+        self.jumpstart_btn.setStyleSheet(
+            "font-weight: bold; font-size: 13px;"
+            "background: rgb(60, 130, 60); color: white; border-radius: 4px;"
+        )
+        fms_layout.addWidget(self.jumpstart_btn)
+
+        # RPM display — for spinning the Charging Wheel (§3.3.4 Generate Electricity)
+        rpm_row = QHBoxLayout()
+        rpm_row.setSpacing(6)
+        rpm_lbl = QLabel("Grid Frequency:")
+        rpm_lbl.setStyleSheet("font-size: 12px;")
+        self.fms_rpm_label = QLabel("--  RPM")
+        self.fms_rpm_label.setStyleSheet(
+            "font-size: 18px; font-weight: bold; color: rgb(255, 200, 100);"
+        )
+        self.fms_rpm_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        rpm_row.addWidget(rpm_lbl)
+        rpm_row.addWidget(self.fms_rpm_label, 1)
+        fms_layout.addLayout(rpm_row)
+
+        left_layout.addWidget(fms_group)
+
+        # Auto routine selector
+        auto_group = QGroupBox("Autonomous")
+        auto_layout = QVBoxLayout(auto_group)
+        auto_layout.setSpacing(5)
         self.auto_routine_selector = QComboBox()
         self.auto_routine_selector.setObjectName("auto_routine_selector")
-        self.auto_run_selected_button = QPushButton("Run Selected Auto")
-        self.auto_run_selected_button.setObjectName("auto_run_selected_button")
-        self.auto_cancel_button = QPushButton("Cancel Auto")
-        self.auto_cancel_button.setObjectName("auto_cancel_button")
-        self.auto_routine_description_label = QLabel("Selected Auto: None")
-        self.auto_routine_description_label.setWordWrap(True)
-        self.auto_status_label = QLabel("Auto Status: Idle")
-        self.auto_status_detail_label = QLabel("Auto Detail: No routine running")
-        self.auto_status_detail_label.setWordWrap(True)
-        self.auto_status_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        self.auto_status_detail_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
-        control_layout.addWidget(self.auto_routine_selector, 3, 0, 1, 2)
-        control_layout.addWidget(self.auto_run_selected_button, 3, 2)
-        control_layout.addWidget(self.auto_cancel_button, 4, 0)
-        control_layout.addWidget(self.auto_status_label, 4, 1, 1, 2)
-        control_layout.addWidget(self.auto_routine_description_label, 5, 0, 1, 3)
-        control_layout.addWidget(self.auto_status_detail_label, 6, 0, 1, 3)
-        control_layout.setColumnStretch(0, 1)
-        control_layout.setColumnStretch(1, 1)
-        control_layout.setColumnStretch(2, 1)
-        center_layout.addWidget(control_group)
+        self.auto_routine_selector.setMinimumHeight(28)
+        auto_layout.addWidget(self.auto_routine_selector)
 
-        field_group = QGroupBox("Field / Driver View")
-        field_layout = QVBoxLayout(field_group)
-        field_layout.setContentsMargins(10, 10, 10, 10)
+        auto_btn_row = QHBoxLayout()
+        auto_btn_row.setSpacing(6)
+        self.auto_run_selected_button = QPushButton("Run Auto")
+        self.auto_run_selected_button.setObjectName("auto_run_selected_button")
+        self.auto_run_selected_button.setMinimumHeight(28)
+        self.auto_cancel_button = QPushButton("Cancel")
+        self.auto_cancel_button.setObjectName("auto_cancel_button")
+        self.auto_cancel_button.setMinimumHeight(28)
+        auto_btn_row.addWidget(self.auto_run_selected_button)
+        auto_btn_row.addWidget(self.auto_cancel_button)
+        auto_layout.addLayout(auto_btn_row)
+
+        self.auto_routine_description_label = QLabel("Selected: None")
+        self.auto_routine_description_label.setWordWrap(True)
+        self.auto_routine_description_label.setStyleSheet("font-size: 11px; color: rgb(180, 190, 200);")
+        self.auto_status_label = QLabel("Status: Idle")
+        self.auto_status_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self.auto_status_detail_label = QLabel("No routine running")
+        self.auto_status_detail_label.setWordWrap(True)
+        self.auto_status_detail_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        self.auto_status_detail_label.setStyleSheet("font-size: 11px; color: rgb(180, 190, 200);")
+        auto_layout.addWidget(self.auto_routine_description_label)
+        auto_layout.addWidget(self.auto_status_label)
+        auto_layout.addWidget(self.auto_status_detail_label)
+        left_layout.addWidget(auto_group)
+
+        # Gamepad state
+        pad_group = QGroupBox("Gamepad")
+        pad_layout = QVBoxLayout(pad_group)
+        pad_layout.setSpacing(4)
+        self.gamepad_label.setStyleSheet("font-size: 12px;")
+        pad_layout.addWidget(self.gamepad_label)
+
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(4)
+        for lbl in (self.button_b_label, self.button_y_label,
+                    self.button_a_label, self.button_x_label):
+            lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            lbl.setMinimumWidth(28)
+            lbl.setStyleSheet("border: 1px solid rgb(60, 70, 80); border-radius: 4px;"
+                              "padding: 2px; font-size: 12px; font-weight: bold;")
+            btn_row.addWidget(lbl)
+        pad_layout.addLayout(btn_row)
+
+        axes_row = QHBoxLayout()
+        axes_row.setSpacing(4)
+        for lbl in (self.lx_label, self.ly_label, self.rx_label, self.ry_label):
+            lbl.setStyleSheet("font-size: 11px; color: rgb(180, 190, 200);")
+            axes_row.addWidget(lbl)
+        pad_layout.addLayout(axes_row)
+        left_layout.addWidget(pad_group)
+
+        left_layout.addStretch(1)
+
+        # ── CENTER: FIELD MAP / DRIVER CAMERA TABS ───────────────────────────
         if not hasattr(self, "main_center_tabs"):
             self.main_center_tabs = QTabWidget()
             self.main_center_tabs.setObjectName("main_center_tabs")
+        self.main_center_tabs.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+
         if not hasattr(self, "main_field_tab"):
             self.main_field_tab = QWidget()
         if self.main_field_tab.layout() is None:
@@ -592,7 +741,6 @@ class DriverUIHelpers:
             self.main_driver_camera_tab_layout.setContentsMargins(0, 0, 0, 0)
         else:
             self.main_driver_camera_tab_layout = self.main_driver_camera_tab.layout()
-
         if not hasattr(self, "main_driver_camera_placeholder"):
             self.main_driver_camera_placeholder = CameraView("Driver Camera\nWaiting for stream...")
             self.main_driver_camera_placeholder.setMinimumSize(320, 240)
@@ -605,45 +753,34 @@ class DriverUIHelpers:
         if self.main_center_tabs.indexOf(self.main_driver_camera_tab) == -1:
             self.main_center_tabs.addTab(self.main_driver_camera_tab, "Driver Camera")
         else:
-            self.main_center_tabs.setTabText(self.main_center_tabs.indexOf(self.main_driver_camera_tab), "Driver Camera")
-        field_layout.addWidget(self.main_center_tabs, 1)
-        center_layout.addWidget(field_group, 1)
+            self.main_center_tabs.setTabText(
+                self.main_center_tabs.indexOf(self.main_driver_camera_tab), "Driver Camera")
 
-        right_column = QWidget(self.frame)
-        right_layout = QVBoxLayout(right_column)
-        right_layout.setContentsMargins(0, 0, 0, 0)
-        right_layout.setSpacing(12)
-
-        if hasattr(self, "main_camera_stack_container") or hasattr(self, "main_camera_placeholder"):
-            camera_group = QGroupBox("Camera Stack")
-            camera_layout = QVBoxLayout(camera_group)
-            camera_layout.setContentsMargins(10, 10, 10, 10)
-            if not hasattr(self, "main_camera_stack_container"):
-                self.main_camera_stack_container = QWidget()
-                self.main_camera_stack_container.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
-                self.main_camera_stack_container.setStyleSheet("background-color: transparent;")
+        # ── RIGHT SIDEBAR: camera stack ───────────────────────────────────────
+        right_sidebar = None
+        if hasattr(self, "main_camera_stack_container"):
+            right_sidebar = QWidget(self.frame)
+            right_sidebar.setFixedWidth(220)
+            right_sidebar.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
+            right_layout = QVBoxLayout(right_sidebar)
+            right_layout.setContentsMargins(0, 0, 0, 0)
+            right_layout.setSpacing(0)
+            cam_group = QGroupBox("Cameras")
+            cam_layout = QVBoxLayout(cam_group)
+            cam_layout.setContentsMargins(6, 6, 6, 6)
             self.main_camera_stack_container.setMinimumHeight(0)
-            self.main_camera_stack_container.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
-            camera_layout.addWidget(self.main_camera_stack_container, 1)
-            right_layout.addWidget(camera_group, 1)
+            self.main_camera_stack_container.setSizePolicy(
+                QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
+            cam_layout.addWidget(self.main_camera_stack_container, 1)
+            right_layout.addWidget(cam_group, 1)
 
-        root_layout.addWidget(left_column, 0, 0)
-        root_layout.addWidget(center_column, 0, 1)
-        root_layout.addWidget(right_column, 0, 2)
-        root_layout.setColumnStretch(0, 2)
-        root_layout.setColumnStretch(1, 5)
-        root_layout.setColumnStretch(2, 2)
+        root_layout.addWidget(left_sidebar)
+        root_layout.addWidget(self.main_center_tabs, 1)
+        if right_sidebar is not None:
+            root_layout.addWidget(right_sidebar)
 
-        left_column.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
-        center_column.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        right_column.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
-
-        control_group.setMinimumHeight(140)
         if hasattr(self, "main_camera_placeholder"):
             self.main_camera_placeholder.hide()
-        if hasattr(self, "main_camera_stack_container"):
-            self.main_camera_stack_container.setMinimumWidth(220)
-            self.main_camera_stack_container.setMinimumHeight(0)
 
     def setup_odometry_tab(self):
         self.odometry_tab = QWidget()
@@ -717,6 +854,274 @@ class DriverUIHelpers:
         layout.addWidget(actions_group, 3, 2)
 
         self.main_tabs.addTab(self.odometry_tab, "Odometry")
+
+    def setup_mechanism_tab(self):
+        self.mechanism_tab = QWidget()
+
+        # Wrap everything in a scroll area so it fits any window size
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+
+        content = QWidget()
+        vlayout = QVBoxLayout(content)
+        vlayout.setContentsMargins(12, 12, 12, 12)
+        vlayout.setSpacing(12)
+
+        # ── Elevator PID ─────────────────────────────────────────────────────
+        elev_group = QGroupBox("Elevator PID")
+        elev_outer = QHBoxLayout(elev_group)
+
+        gains_layout = QGridLayout()
+        gains_layout.addWidget(QLabel("kP:"), 0, 0)
+        self.elev_kp_spin = QDoubleSpinBox()
+        self.elev_kp_spin.setDecimals(4)
+        self.elev_kp_spin.setRange(0.0, 10.0)
+        self.elev_kp_spin.setSingleStep(0.0001)
+        self.elev_kp_spin.setValue(0.002)
+        gains_layout.addWidget(self.elev_kp_spin, 0, 1)
+
+        gains_layout.addWidget(QLabel("kI:"), 1, 0)
+        self.elev_ki_spin = QDoubleSpinBox()
+        self.elev_ki_spin.setDecimals(6)
+        self.elev_ki_spin.setRange(0.0, 10.0)
+        self.elev_ki_spin.setSingleStep(0.000001)
+        self.elev_ki_spin.setValue(0.0)
+        gains_layout.addWidget(self.elev_ki_spin, 1, 1)
+
+        gains_layout.addWidget(QLabel("kD:"), 2, 0)
+        self.elev_kd_spin = QDoubleSpinBox()
+        self.elev_kd_spin.setDecimals(6)
+        self.elev_kd_spin.setRange(0.0, 10.0)
+        self.elev_kd_spin.setSingleStep(0.000001)
+        self.elev_kd_spin.setValue(0.0)
+        gains_layout.addWidget(self.elev_kd_spin, 2, 1)
+
+        gains_layout.addWidget(QLabel("Max Out:"), 3, 0)
+        self.elev_max_out_spin = QDoubleSpinBox()
+        self.elev_max_out_spin.setDecimals(2)
+        self.elev_max_out_spin.setRange(0.0, 1.0)
+        self.elev_max_out_spin.setSingleStep(0.05)
+        self.elev_max_out_spin.setValue(0.6)
+        gains_layout.addWidget(self.elev_max_out_spin, 3, 1)
+
+        gains_layout.addWidget(QLabel("Decel Zone (ticks):"), 4, 0)
+        self.elev_decel_zone_spin = QSpinBox()
+        self.elev_decel_zone_spin.setRange(0, 10000)
+        self.elev_decel_zone_spin.setSingleStep(50)
+        self.elev_decel_zone_spin.setValue(800)
+        gains_layout.addWidget(self.elev_decel_zone_spin, 4, 1)
+
+        self.elev_set_gains_btn = QPushButton("Set Gains")
+        gains_layout.addWidget(self.elev_set_gains_btn, 5, 0, 1, 2)
+        elev_outer.addLayout(gains_layout)
+
+        setpoint_layout = QVBoxLayout()
+        sp_row = QHBoxLayout()
+        sp_row.addWidget(QLabel("Setpoint (ticks):"))
+        self.elev_setpoint_spin = QSpinBox()
+        self.elev_setpoint_spin.setRange(-100000, 100000)
+        self.elev_setpoint_spin.setValue(0)
+        sp_row.addWidget(self.elev_setpoint_spin)
+        self.elev_go_btn = QPushButton("Go")
+        sp_row.addWidget(self.elev_go_btn)
+        setpoint_layout.addLayout(sp_row)
+
+        presets_row = QHBoxLayout()
+        self.elev_preset_buttons = {}
+        for label, ticks in [("Ground", 0), ("Low", 500), ("Mid", 1500), ("High", 3000)]:
+            btn = QPushButton(label)
+            btn.setProperty("elev_ticks", ticks)
+            presets_row.addWidget(btn)
+            self.elev_preset_buttons[label] = btn
+        setpoint_layout.addLayout(presets_row)
+
+        self.elev_disable_btn = QPushButton("Disable PID")
+        self.elev_disable_btn.setStyleSheet("color: rgb(230, 80, 80);")
+        setpoint_layout.addWidget(self.elev_disable_btn)
+        elev_outer.addLayout(setpoint_layout)
+
+        status_layout = QVBoxLayout()
+        self.elev_status_label = QLabel("PID: Inactive")
+        self.elev_position_label = QLabel("Position: 0")
+        self.elev_setpoint_label = QLabel("Setpoint: 0")
+        self.elev_output_label = QLabel("Output: 0.00")
+        for lbl in (self.elev_status_label, self.elev_position_label,
+                    self.elev_setpoint_label, self.elev_output_label):
+            status_layout.addWidget(lbl)
+        status_layout.addStretch(1)
+        elev_outer.addLayout(status_layout)
+
+        vlayout.addWidget(elev_group)
+
+        # ── Elevator Manual Drive ─────────────────────────────────────────────
+        manual_group = QGroupBox("Elevator Manual Drive")
+        manual_outer = QHBoxLayout(manual_group)
+
+        def _motor_column(label_text):
+            col = QVBoxLayout()
+            col.addWidget(QLabel(label_text))
+            slider = QSlider(Qt.Orientation.Vertical)
+            slider.setRange(-100, 100)
+            slider.setValue(0)
+            slider.setTickPosition(QSlider.TickPosition.TicksBothSides)
+            slider.setTickInterval(25)
+            slider.setMinimumHeight(120)
+            pct_label = QLabel("0%")
+            pct_label.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+            col.addWidget(slider, 1, Qt.AlignmentFlag.AlignHCenter)
+            col.addWidget(pct_label)
+            return col, slider, pct_label
+
+        left_col, self.elev_manual_left_slider, self.elev_manual_left_label = _motor_column("Left")
+        right_col, self.elev_manual_right_slider, self.elev_manual_right_label = _motor_column("Right")
+
+        self.elev_manual_left_slider.valueChanged.connect(
+            lambda v: self.elev_manual_left_label.setText(f"{v}%"))
+        self.elev_manual_right_slider.valueChanged.connect(
+            lambda v: self.elev_manual_right_label.setText(f"{v}%"))
+
+        manual_outer.addLayout(left_col)
+        manual_outer.addLayout(right_col)
+
+        btn_col = QVBoxLayout()
+        self.elev_manual_send_btn = QPushButton("Send")
+        self.elev_manual_stop_btn = QPushButton("Stop")
+        self.elev_manual_stop_btn.setStyleSheet("color: rgb(230, 80, 80);")
+        btn_col.addWidget(self.elev_manual_send_btn)
+        btn_col.addWidget(self.elev_manual_stop_btn)
+        btn_col.addStretch(1)
+        manual_outer.addLayout(btn_col)
+
+        vlayout.addWidget(manual_group)
+
+        # ── Arm PID ───────────────────────────────────────────────────────────
+        arm_group = QGroupBox("Arm PID  (degrees)")
+        arm_outer = QHBoxLayout(arm_group)
+
+        arm_gains_layout = QGridLayout()
+        arm_gains_layout.addWidget(QLabel("kP:"), 0, 0)
+        self.arm_kp_spin = QDoubleSpinBox()
+        self.arm_kp_spin.setDecimals(4)
+        self.arm_kp_spin.setRange(0.0, 10.0)
+        self.arm_kp_spin.setSingleStep(0.0001)
+        self.arm_kp_spin.setValue(0.01)
+        arm_gains_layout.addWidget(self.arm_kp_spin, 0, 1)
+
+        arm_gains_layout.addWidget(QLabel("kI:"), 1, 0)
+        self.arm_ki_spin = QDoubleSpinBox()
+        self.arm_ki_spin.setDecimals(6)
+        self.arm_ki_spin.setRange(0.0, 10.0)
+        self.arm_ki_spin.setSingleStep(0.000001)
+        self.arm_ki_spin.setValue(0.0)
+        arm_gains_layout.addWidget(self.arm_ki_spin, 1, 1)
+
+        arm_gains_layout.addWidget(QLabel("kD:"), 2, 0)
+        self.arm_kd_spin = QDoubleSpinBox()
+        self.arm_kd_spin.setDecimals(6)
+        self.arm_kd_spin.setRange(0.0, 10.0)
+        self.arm_kd_spin.setSingleStep(0.000001)
+        self.arm_kd_spin.setValue(0.0)
+        arm_gains_layout.addWidget(self.arm_kd_spin, 2, 1)
+
+        arm_gains_layout.addWidget(QLabel("Max Out:"), 3, 0)
+        self.arm_max_out_spin = QDoubleSpinBox()
+        self.arm_max_out_spin.setDecimals(2)
+        self.arm_max_out_spin.setRange(0.0, 1.0)
+        self.arm_max_out_spin.setSingleStep(0.05)
+        self.arm_max_out_spin.setValue(0.5)
+        arm_gains_layout.addWidget(self.arm_max_out_spin, 3, 1)
+
+        arm_gains_layout.addWidget(QLabel("Decel Zone (°):"), 4, 0)
+        self.arm_decel_zone_spin = QDoubleSpinBox()
+        self.arm_decel_zone_spin.setDecimals(1)
+        self.arm_decel_zone_spin.setRange(0.0, 360.0)
+        self.arm_decel_zone_spin.setSingleStep(5.0)
+        self.arm_decel_zone_spin.setValue(15.0)
+        arm_gains_layout.addWidget(self.arm_decel_zone_spin, 4, 1)
+
+        self.arm_set_gains_btn = QPushButton("Set Gains")
+        arm_gains_layout.addWidget(self.arm_set_gains_btn, 5, 0, 1, 2)
+        arm_outer.addLayout(arm_gains_layout)
+
+        arm_sp_layout = QVBoxLayout()
+        arm_sp_row = QHBoxLayout()
+        arm_sp_row.addWidget(QLabel("Setpoint (°):"))
+        self.arm_setpoint_spin = QDoubleSpinBox()
+        self.arm_setpoint_spin.setDecimals(1)
+        self.arm_setpoint_spin.setRange(-720.0, 720.0)
+        self.arm_setpoint_spin.setSingleStep(5.0)
+        self.arm_setpoint_spin.setValue(0.0)
+        arm_sp_row.addWidget(self.arm_setpoint_spin)
+        self.arm_go_btn = QPushButton("Go")
+        arm_sp_row.addWidget(self.arm_go_btn)
+        arm_sp_layout.addLayout(arm_sp_row)
+
+        arm_presets_row = QHBoxLayout()
+        self.arm_preset_buttons = {}
+        for label, deg in [("0°", 0.0), ("45°", 45.0), ("90°", 90.0), ("180°", 180.0)]:
+            btn = QPushButton(label)
+            btn.setProperty("arm_degrees", deg)
+            arm_presets_row.addWidget(btn)
+            self.arm_preset_buttons[label] = btn
+        arm_sp_layout.addLayout(arm_presets_row)
+
+        self.arm_disable_btn = QPushButton("Disable PID")
+        self.arm_disable_btn.setStyleSheet("color: rgb(230, 80, 80);")
+        arm_sp_layout.addWidget(self.arm_disable_btn)
+        arm_outer.addLayout(arm_sp_layout)
+
+        arm_status_layout = QVBoxLayout()
+        self.arm_status_label = QLabel("PID: Inactive")
+        self.arm_position_label = QLabel("Position: 0.0°")
+        self.arm_setpoint_label = QLabel("Setpoint: 0.0°")
+        self.arm_output_label = QLabel("Output: 0.000")
+        for lbl in (self.arm_status_label, self.arm_position_label,
+                    self.arm_setpoint_label, self.arm_output_label):
+            arm_status_layout.addWidget(lbl)
+        arm_status_layout.addStretch(1)
+        arm_outer.addLayout(arm_status_layout)
+
+        vlayout.addWidget(arm_group)
+
+        # ── Arm Manual Drive ──────────────────────────────────────────────────
+        arm_manual_group = QGroupBox("Arm Manual Drive")
+        arm_manual_outer = QHBoxLayout(arm_manual_group)
+
+        arm_slider_col = QVBoxLayout()
+        arm_slider_col.addWidget(QLabel("Arm Speed"))
+        self.arm_manual_slider = QSlider(Qt.Orientation.Vertical)
+        self.arm_manual_slider.setRange(-100, 100)
+        self.arm_manual_slider.setValue(0)
+        self.arm_manual_slider.setTickPosition(QSlider.TickPosition.TicksBothSides)
+        self.arm_manual_slider.setTickInterval(25)
+        self.arm_manual_slider.setMinimumHeight(120)
+        self.arm_manual_label = QLabel("0%")
+        self.arm_manual_label.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        self.arm_manual_slider.valueChanged.connect(
+            lambda v: self.arm_manual_label.setText(f"{v}%"))
+        arm_slider_col.addWidget(self.arm_manual_slider, 1, Qt.AlignmentFlag.AlignHCenter)
+        arm_slider_col.addWidget(self.arm_manual_label)
+        arm_manual_outer.addLayout(arm_slider_col)
+
+        arm_btn_col = QVBoxLayout()
+        self.arm_manual_send_btn = QPushButton("Send")
+        self.arm_manual_stop_btn = QPushButton("Stop")
+        self.arm_manual_stop_btn.setStyleSheet("color: rgb(230, 80, 80);")
+        arm_btn_col.addWidget(self.arm_manual_send_btn)
+        arm_btn_col.addWidget(self.arm_manual_stop_btn)
+        arm_btn_col.addStretch(1)
+        arm_manual_outer.addLayout(arm_btn_col)
+
+        vlayout.addWidget(arm_manual_group)
+        vlayout.addStretch(1)
+
+        scroll.setWidget(content)
+        tab_layout = QVBoxLayout(self.mechanism_tab)
+        tab_layout.setContentsMargins(0, 0, 0, 0)
+        tab_layout.addWidget(scroll)
+
+        self.main_tabs.addTab(self.mechanism_tab, "Mechanism")
 
     def setup_settings_tab(self):
         self.settings_tab = QWidget()
@@ -880,6 +1285,206 @@ class DriverUIHelpers:
         except TypeError:
             pretty_payload = str(payload)
         self.append_diagnostic(panel_name, f"{label}\n{pretty_payload}")
+
+    def setup_score_tab(self):
+        self.score_tab = QWidget()
+        layout = QGridLayout(self.score_tab)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setHorizontalSpacing(12)
+        layout.setVerticalSpacing(12)
+
+        # ── Input group ──────────────────────────────────────────────────────
+        input_group = QGroupBox("Scoring Inputs")
+        input_layout = QGridLayout(input_group)
+
+        def _spin(min_val=0, max_val=99, default=0):
+            s = QSpinBox()
+            s.setMinimum(min_val)
+            s.setMaximum(max_val)
+            s.setValue(default)
+            return s
+
+        row = 0
+        input_layout.addWidget(QLabel("Batteries (Auto):"), row, 0)
+        self.score_batteries_auto = _spin()
+        input_layout.addWidget(self.score_batteries_auto, row, 1)
+
+        row += 1
+        input_layout.addWidget(QLabel("Batteries (Teleop):"), row, 0)
+        self.score_batteries_tele = _spin()
+        input_layout.addWidget(self.score_batteries_tele, row, 1)
+
+        row += 1
+        self.score_auto_zone_exit = QCheckBox("Auto Zone Exit (+3)")
+        input_layout.addWidget(self.score_auto_zone_exit, row, 0, 1, 2)
+
+        row += 1
+        input_layout.addWidget(QLabel("Jumpstarts (Auto):"), row, 0)
+        self.score_jumpstarts_auto = _spin()
+        input_layout.addWidget(self.score_jumpstarts_auto, row, 1)
+
+        row += 1
+        input_layout.addWidget(QLabel("Jumpstarts (Teleop):"), row, 0)
+        self.score_jumpstarts_tele = _spin()
+        input_layout.addWidget(self.score_jumpstarts_tele, row, 1)
+
+        row += 1
+        input_layout.addWidget(QLabel("Wheel Time Auto (s):"), row, 0)
+        self.score_wheel_auto = _spin(max_val=9999)
+        input_layout.addWidget(self.score_wheel_auto, row, 1)
+
+        row += 1
+        input_layout.addWidget(QLabel("Wheel Time Teleop (s):"), row, 0)
+        self.score_wheel_tele = _spin(max_val=9999)
+        input_layout.addWidget(self.score_wheel_tele, row, 1)
+
+        row += 1
+        input_layout.addWidget(QLabel("Climb:"), row, 0)
+        self.score_climb_combo = QComboBox()
+        self.score_climb_combo.addItems(["None", "Line", "High"])
+        input_layout.addWidget(self.score_climb_combo, row, 1)
+
+        row += 1
+        input_layout.addWidget(QLabel("Minor Penalties:"), row, 0)
+        self.score_minor_penalties = _spin()
+        input_layout.addWidget(self.score_minor_penalties, row, 1)
+
+        row += 1
+        input_layout.addWidget(QLabel("Major Penalties:"), row, 0)
+        self.score_major_penalties = _spin()
+        input_layout.addWidget(self.score_major_penalties, row, 1)
+
+        calc_btn = QPushButton("Calculate Score")
+        calc_btn.clicked.connect(self._recalculate_score)
+        input_layout.addWidget(calc_btn, row + 1, 0, 1, 2)
+
+        layout.addWidget(input_group, 0, 0)
+
+        # ── Breakdown group ──────────────────────────────────────────────────
+        breakdown_group = QGroupBox("Score Breakdown")
+        breakdown_layout = QVBoxLayout(breakdown_group)
+        self.score_breakdown_table = QTableWidget(0, 2)
+        self.score_breakdown_table.setHorizontalHeaderLabels(["Component", "Points"])
+        self.score_breakdown_table.horizontalHeader().setSectionResizeMode(
+            0, QHeaderView.ResizeMode.Stretch
+        )
+        self.score_breakdown_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.score_breakdown_table.setStyleSheet(
+            "background-color: rgb(15, 20, 25); color: rgb(220, 230, 235);"
+        )
+        breakdown_layout.addWidget(self.score_breakdown_table)
+        self.score_total_label = QLabel("Total: 0")
+        self.score_total_label.setStyleSheet("font-size: 18px; font-weight: bold;")
+        breakdown_layout.addWidget(self.score_total_label)
+
+        layout.addWidget(breakdown_group, 0, 1)
+
+        self.main_tabs.addTab(self.score_tab, "Score")
+
+    def _recalculate_score(self):
+        if calculate_score is None:
+            return
+        breakdown = calculate_score(
+            batteries_auto=self.score_batteries_auto.value(),
+            batteries_teleop=self.score_batteries_tele.value(),
+            auto_zone_exit=self.score_auto_zone_exit.isChecked(),
+            jumpstarts_auto=self.score_jumpstarts_auto.value(),
+            jumpstarts_teleop=self.score_jumpstarts_tele.value(),
+            wheel_time_auto_s=self.score_wheel_auto.value(),
+            wheel_time_teleop_s=self.score_wheel_tele.value(),
+            climb=self.score_climb_combo.currentText(),
+            minor_penalties=self.score_minor_penalties.value(),
+            major_penalties=self.score_major_penalties.value(),
+        )
+        display_rows = [
+            ("Battery pts (auto)", breakdown["battery_pts_auto"]),
+            ("Battery pts (teleop)", breakdown["battery_pts_tele"]),
+            ("Capacity", breakdown["capacity"]),
+            ("KJ from jumpstarts", breakdown["kj_jumpstart"]),
+            ("KJ from wheel", breakdown["kj_wheel"]),
+            ("KJ pts (capped)", breakdown["kj_pts"]),
+            ("Auto exit pts", breakdown["auto_exit_pts"]),
+            ("Climb pts", breakdown["climb_pts"]),
+            ("Penalties", -breakdown["penalty_pts"]),
+        ]
+        table = self.score_breakdown_table
+        table.setRowCount(len(display_rows))
+        for r, (label, value) in enumerate(display_rows):
+            table.setItem(r, 0, QTableWidgetItem(label))
+            table.setItem(r, 1, QTableWidgetItem(str(value)))
+        self.score_total_label.setText(f"Total: {breakdown['total']}")
+
+    def setup_match_history_tab(self):
+        self.match_history_tab = QWidget()
+        layout = QVBoxLayout(self.match_history_tab)
+        layout.setContentsMargins(12, 12, 12, 12)
+
+        # Stats bar
+        stats_layout = QHBoxLayout()
+        self.mh_wins_label = QLabel("W: 0")
+        self.mh_losses_label = QLabel("L: 0")
+        self.mh_ties_label = QLabel("T: 0")
+        self.mh_avg_label = QLabel("Avg: 0.0")
+        self.mh_high_label = QLabel("High: 0")
+        for lbl in (self.mh_wins_label, self.mh_losses_label, self.mh_ties_label,
+                    self.mh_avg_label, self.mh_high_label):
+            lbl.setStyleSheet("font-weight: bold; margin-right: 16px;")
+            stats_layout.addWidget(lbl)
+        stats_layout.addStretch(1)
+        refresh_btn = QPushButton("Refresh")
+        refresh_btn.clicked.connect(self._refresh_match_history)
+        stats_layout.addWidget(refresh_btn)
+        layout.addLayout(stats_layout)
+
+        # History table
+        cols = ["ID", "Label", "Type", "Alliance", "Opponent", "Our Score",
+                "Opp Score", "Outcome", "Notes"]
+        self.mh_table = QTableWidget(0, len(cols))
+        self.mh_table.setHorizontalHeaderLabels(cols)
+        self.mh_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        self.mh_table.horizontalHeader().setSectionResizeMode(8, QHeaderView.ResizeMode.Stretch)
+        self.mh_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.mh_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.mh_table.setStyleSheet(
+            "background-color: rgb(15, 20, 25); color: rgb(220, 230, 235);"
+        )
+        layout.addWidget(self.mh_table, 1)
+
+        self.main_tabs.addTab(self.match_history_tab, "Match History")
+
+        if MatchHistory is not None:
+            self._mh_store = MatchHistory.load()
+            self._refresh_match_history()
+        else:
+            self._mh_store = None
+
+    def _refresh_match_history(self):
+        if self._mh_store is None:
+            return
+        self._mh_store = MatchHistory.load()
+        h = self._mh_store
+        self.mh_wins_label.setText(f"W: {h.wins}")
+        self.mh_losses_label.setText(f"L: {h.losses}")
+        self.mh_ties_label.setText(f"T: {h.ties}")
+        self.mh_avg_label.setText(f"Avg: {h.avg_score:.1f}")
+        self.mh_high_label.setText(f"High: {h.high_score}")
+
+        self.mh_table.setRowCount(0)
+        outcome_colors = {"WIN": "#2e7d32", "LOSS": "#b71c1c", "TIE": "#f57f17"}
+        for match in reversed(h.matches):
+            r = self.mh_table.rowCount()
+            self.mh_table.insertRow(r)
+            cells = [
+                match.match_id, match.match_label, match.match_type,
+                match.alliance, match.opponent_team, str(match.our_score),
+                str(match.opponent_score), match.outcome, match.notes,
+            ]
+            for c, text in enumerate(cells):
+                item = QTableWidgetItem(text)
+                if c == 7:
+                    color = outcome_colors.get(match.outcome, "#ffffff")
+                    item.setForeground(QColor(color))
+                self.mh_table.setItem(r, c, item)
 
     def setup_field_view(self):
         self.field_widget = FieldWidget(self)

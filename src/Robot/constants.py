@@ -8,7 +8,7 @@ def _is_truthy_env(var_name: str, default: str) -> bool:
 COMMAND_PORT = 5555
 TELEMETRY_PORT = 5556
 TELEMETRY_RATE_HZ = 10
-HEARTBEAT_TIMEOUT_S = 2.5
+HEARTBEAT_TIMEOUT_S = 0.8   # §4.4.7 — must halt within 1 s of losing signal
 WATCHDOG_CHECK_INTERVAL_S = 0.1
 AUTO_LOOP_INTERVAL_S = 0.05
 MAX_LINEAR_SPEED_MPS = 1.2
@@ -48,6 +48,11 @@ MOTOR_DIRECTION_MULTIPLIER = (
     float(os.environ.get("KSU_MOTOR_RL_SIGN", "1.0")),
     float(os.environ.get("KSU_MOTOR_RR_SIGN", "1.0")),
 )
+
+# Arm motor encoder resolution.
+# Set to actual ticks-per-revolution including gearbox.
+# Example: 50:1 gearbox + 28 CPR encoder + quadrature = 50 * 28 * 4 = 5600
+ARM_TICKS_PER_REV = 1440  # TODO: measure and update for your actual motor + gearbox
 
 JOYSTICK_DEADBAND = 0.06
 INPUT_EXPO = 1.4

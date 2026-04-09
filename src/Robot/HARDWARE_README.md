@@ -31,10 +31,19 @@ Pi GPIO references in this document use BCM numbering when applicable.
 
 ### Pi-side devices and buses
 
-| Device | Pi connection | Purpose |
-|---|---|---|
-| Teensy 4.1 | USB serial on `/dev/ttyACM0` | Main MCU coprocessor link |
-| Qwiic OTOS | I2C `SDA` / `SCL` | Optical odometry |
+| Device | Pi connection | Software name | Purpose |
+|---|---|---|---|
+| Teensy 4.1 | USB serial `/dev/ttyACM0` | — | Main MCU coprocessor link |
+| Qwiic OTOS | I2C `SDA` / `SCL` | — | Optical odometry |
+| Pi Camera | CSI ribbon connector 0 | `driver` | **Primary driver view** — picamera2 backend, AprilTag off |
+| USB Camera 1 | USB (OpenCV index `0`) | `front_left` | Secondary view — AprilTag detection enabled |
+| USB Camera 2 | USB (OpenCV index `1`) | `front_right` | Tertiary view — AprilTag detection enabled |
+
+#### Camera notes
+
+- Override the USB camera OpenCV indices with env vars `KSU_CAMERA_FRONT_LEFT_SELECTOR` and `KSU_CAMERA_FRONT_RIGHT_SELECTOR` if the system assigns them differently (run `v4l2-ctl --list-devices` to confirm).
+- If only one USB camera is connected, the second will fail gracefully after `CAMERA_INIT_MAX_ATTEMPTS` retries and simply not stream.
+- AprilTag detection on `driver` is disabled by default — enable via `KSU_CAMERA_DRIVER_ENABLE_APRILTAG=1` if needed.
 
 ## Teensy 4.1 pin map
 
@@ -66,11 +75,51 @@ Motor order is `[FL, FR, RL, RR]`.
 | Relay 0 | `33` | `true` |
 | Relay 1 | `34` | `true` |
 
-### LED group
+### Signal Light LED (§4.4.8)
 
-| LED group | R pin | G pin | B pin | W pin | commonAnode |
-|---|---:|---:|---:|---:|---|
-| LED 0 | `9` | `10` | `11` | `12` | `false` |
+LED Group 0 is reserved for the **competition signal light** required by rule §4.4.8.
+It is driven automatically by `signal_light_thread` in `src/Robot/robot.py` — do not use it for anything else.
+
+| LED group | Purpose | R pin | G pin | B pin | W pin | commonAnode |
+|---|---|---:|---:|---:|---:|---|
+| LED 0 | Signal light (§4.4.8) | `9` | `10` | `11` | `12` (unused) | `false` |
+
+#### Behaviour
+
+| Robot state | LED colour | Pattern |
+|---|---|---|
+| Connected (has signal) | Green | Blink ~1 Hz (0.5 s on / 0.5 s off) |
+| Loss of Signal / stopped | Red | Solid (no blink) |
+
+#### Wiring a 4-pin common-cathode RGB LED
+
+```
+Teensy 4.1          Resistor    LED pin
+─────────────────────────────────────────
+Pin  9  (PWM)  ──►  150 Ω  ──►  R  (red)
+Pin 10  (PWM)  ──►  100 Ω  ──►  G  (green)
+Pin 11  (PWM)  ──►  100 Ω  ──►  B  (blue)
+GND            ─────────────►  GND (cathode)
+```
+
+Pin 12 (W channel) is defined in the firmware struct but **not connected** for a 3-channel RGB LED.
+
+**Resistor selection** (Teensy 4.1 runs at 3.3 V, GPIO rated to 3.3 V / ~8 mA per pin):
+
+| Channel | Vf (typ) | Formula | Chosen value |
+|---|---|---|---|
+| Red | 2.0 V | (3.3 − 2.0) / 0.010 = 130 Ω | **150 Ω** |
+| Green | 3.0 V | (3.3 − 3.0) / 0.010 = 30 Ω | **100 Ω** (limits current, protects pin) |
+| Blue | 3.0 V | (3.3 − 3.0) / 0.010 = 30 Ω | **100 Ω** |
+
+Use the larger value when in doubt — the LED will still be clearly visible and the pin stays within its 8 mA limit.
+
+> **Common-anode variant?** Flip the shared pin to 3.3 V, connect each colour pin to the resistor/Teensy as above, and change `commonAnode` to `true` in the firmware `LedGroupConfig`. The firmware already inverts the PWM value when `commonAnode = true`.
+
+#### Why pins 9 / 10 / 11?
+
+All three are PWM-capable on the Teensy 4.1 and are not used by any other subsystem in this repo.  
+Pins 11 and 12 overlap with the SPI0 MOSI/MISO signals, but SPI0 is not used here — they are free to use as general PWM outputs.
 
 ### Servos
 

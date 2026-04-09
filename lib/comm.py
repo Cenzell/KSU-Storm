@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import queue
 import threading
 import time
 from typing import Optional
@@ -21,7 +22,7 @@ COMMAND_PORT = 5555
 TELEMETRY_PORT = 5556
 PING_INTERVAL_S = 1
 HEARTBEAT_TIMEOUT_S = 2.0
-COMMAND_TIMEOUT_MS = 2000
+COMMAND_TIMEOUT_MS = 500   # reduced from 2000 – limits worst-case block
 TELEMETRY_TIMEOUT_MS = 100
 
 class WorkerSignals(QObject):
@@ -220,3 +221,56 @@ class TelemetryReceiver(threading.Thread):
 
     def stop(self) -> None:
         self.running = False
+
+
+class CommandWorker(threading.Thread):
+    """Background thread that serialises ALL ZMQ REQ/REP sends.
+
+    The main (UI) thread must never call send_command() directly because it
+    blocks on the socket lock.  Instead, post work here and return immediately.
+
+    Joystick updates use a "latest wins" slot: if a new joystick state arrives
+    before the previous one has been sent, only the newest state is transmitted.
+    All other commands are queued in order.
+    """
+
+    _JOYSTICK_SENTINEL = "_joystick_update"
+
+    def __init__(self, conn_manager: ConnectionManager) -> None:
+        super().__init__(daemon=True)
+        self._conn_manager = conn_manager
+        self._queue: queue.SimpleQueue = queue.SimpleQueue()
+        self._joystick_lock = threading.Lock()
+        self._pending_joystick: Optional[tuple] = None
+
+    # ── public API (called from the main thread) ──────────────────────────
+
+    def send_joystick(self, lx: float, ly: float, rx: float, ry: float) -> None:
+        """Non-blocking: replace pending joystick state with the latest values."""
+        with self._joystick_lock:
+            self._pending_joystick = (lx, ly, rx, ry)
+        # Wake the worker if it is sleeping between commands.
+        self._queue.put((self._JOYSTICK_SENTINEL, {}))
+
+    def enqueue(self, command_type: str, **kwargs) -> None:
+        """Non-blocking: queue a fire-and-forget command."""
+        self._queue.put((command_type, kwargs))
+
+    # ── worker loop ───────────────────────────────────────────────────────
+
+    def run(self) -> None:
+        while True:
+            command_type, kwargs = self._queue.get()
+
+            client = self._conn_manager.get_client()
+            if client is None:
+                continue
+
+            if command_type == self._JOYSTICK_SENTINEL:
+                with self._joystick_lock:
+                    state = self._pending_joystick
+                    self._pending_joystick = None
+                if state is not None:
+                    client.send_joystick(*state)
+            else:
+                client.send_command(command_type, **kwargs)

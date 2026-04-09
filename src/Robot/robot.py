@@ -20,6 +20,7 @@ from serial_bridge import SerialBridge
 
 import zmq
 from constants import (
+    ARM_TICKS_PER_REV,
     AUTO_LOOP_INTERVAL_S,
     COMMAND_PORT,
     ENABLE_CAMERA_BROADCAST,
@@ -107,6 +108,49 @@ def watchdog_thread(server: "RobotServer") -> None:
             time.sleep(WATCHDOG_CHECK_INTERVAL_S)
 
 
+def signal_light_thread(server: "RobotServer") -> None:
+    """Drive the RGB signal light per §4.4.8.
+
+    Connected signal  →  blink green ~1 Hz (0.5 s on / 0.5 s off)
+    Loss of Signal    →  solid red (no blink)
+
+    Colours are chosen to be unambiguous even with a single-colour LED
+    wired to just one channel:
+        green  r=0   g=180  b=0
+        red    r=180 g=0    b=0
+    """
+    BLINK_HALF_S   = 0.5   # half-period → ~1 blink per second
+    LED_ON_COLOR   = (180, 0, 180)   # green — has signal
+    LED_OFF_COLOR  = (0,   0,   0)   # off   — blink low half
+    LED_LOS_COLOR  = (180, 0,   0)   # solid red — Loss of Signal
+
+    led_state = False   # current blink phase
+
+    def _set(r: int, g: int, b: int) -> None:
+        if server.bridge:
+            try:
+                server.bridge.set_led(r, g, b)
+            except Exception as exc:
+                logger.debug("Signal light write failed: %s", exc)
+
+    logger.info("Signal light thread started")
+
+    while server.running:
+        if connection_lost:
+            # §4.4.8: solid (no blink) on Loss of Signal
+            _set(*LED_LOS_COLOR)
+            led_state = False
+            time.sleep(BLINK_HALF_S)
+        else:
+            # §4.4.8: blink ~1 Hz while connected
+            led_state = not led_state
+            _set(*(LED_ON_COLOR if led_state else LED_OFF_COLOR))
+            time.sleep(BLINK_HALF_S)
+
+    # Cleanup: turn off LED when server exits
+    _set(0, 0, 0)
+
+
 def update_heartbeat() -> None:
     """Update the last heartbeat timestamp."""
     global last_heartbeat, connection_lost, heartbeat_seen
@@ -118,6 +162,196 @@ def update_heartbeat() -> None:
         if connection_lost:
             logger.info("Connection restored via command")
             connection_lost = False
+
+
+class _PIDLoop:
+    """Single-axis PID loop with independent integrator state."""
+
+    def __init__(self) -> None:
+        self._integral: float = 0.0
+        self._last_error: float = 0.0
+        self._last_time: float = 0.0
+        self.current_pos: float = 0.0
+        self.last_output: float = 0.0
+
+    def reset(self) -> None:
+        self._integral = 0.0
+        self._last_error = 0.0
+        self._last_time = 0.0
+        self.last_output = 0.0
+
+    def compute(self, current_pos: float, setpoint: float,
+                kp: float, ki: float, kd: float,
+                max_output: float, decel_zone: float) -> float:
+        self.current_pos = current_pos
+        now = time.time()
+        dt = now - self._last_time if self._last_time else 0.02
+        dt = max(0.001, min(dt, 0.5))
+        self._last_time = now
+
+        error = setpoint - current_pos
+        self._integral += error * dt
+
+        # Anti-windup: keep integral contribution within ±max_output
+        if ki > 0:
+            self._integral = max(-max_output / ki, min(max_output / ki, self._integral))
+
+        derivative = (error - self._last_error) / dt
+        self._last_error = error
+
+        raw = kp * error + ki * self._integral + kd * derivative
+
+        # Deceleration zone: cap output proportionally as we near the setpoint.
+        # This prevents arriving at full speed and overshooting.
+        if decel_zone > 0:
+            proximity = min(1.0, abs(error) / decel_zone)
+            effective_max = max(0.05, max_output * proximity)
+        else:
+            effective_max = max_output
+
+        self.last_output = max(-effective_max, min(effective_max, raw))
+        return self.last_output
+
+
+class ElevatorPID:
+    """Single PID loop driving both elevator motors from the averaged encoder position.
+
+    Left side:  encoders[4]  → mech motor[0]
+    Right side: encoders[5]  → mech motor[1]  (sign-corrected externally)
+    Both motors receive the same output computed from the average of the two
+    (sign-normalised) encoder readings.
+    """
+
+    TOLERANCE = 20.0  # ticks
+
+    def __init__(self, kp: float = 0.002, ki: float = 0.0, kd: float = 0.0,
+                 max_output: float = 0.6, decel_zone: float = 800.0) -> None:
+        self.kp = kp
+        self.ki = ki
+        self.kd = kd
+        self.max_output = max_output
+        self.decel_zone = decel_zone
+        self.setpoint: float = 0.0
+        self.active: bool = False
+        self._loop = _PIDLoop()
+
+    def reset(self) -> None:
+        self._loop.reset()
+
+    def set_setpoint(self, setpoint: float) -> None:
+        self.setpoint = float(setpoint)
+        self.reset()
+        self.active = True
+
+    def disable(self) -> None:
+        self.active = False
+        self.reset()
+
+    def compute(self, left_pos: float, right_pos: float) -> float:
+        """Return a single output in [-max_output, max_output] for both motors."""
+        avg_pos = (left_pos + right_pos) / 2.0
+        if abs(self.setpoint - avg_pos) <= self.TOLERANCE:
+            self._loop.last_output = 0.0
+            self._loop.current_pos = avg_pos
+            return 0.0
+        return self._loop.compute(avg_pos, self.setpoint,
+                                  self.kp, self.ki, self.kd,
+                                  self.max_output, self.decel_zone)
+
+    def as_dict(self) -> dict:
+        return {
+            "active": self.active,
+            "kp": self.kp,
+            "ki": self.ki,
+            "kd": self.kd,
+            "max_output": self.max_output,
+            "decel_zone": self.decel_zone,
+            "setpoint": self.setpoint,
+            "current_pos": self._loop.current_pos,
+            "output": self._loop.last_output,
+        }
+
+
+class ArmPID:
+    """Single PID loop for the arm motor, with setpoint in degrees.
+
+    Hardware mapping:
+        Encoder: encoders[6]  → mech motor[2] (arm motor)
+
+    Degrees are converted to ticks using ARM_TICKS_PER_REV from constants.py.
+    Update that constant to match your actual motor + gearbox before tuning.
+    """
+
+    TOLERANCE_DEG = 1.0  # degrees — within this the output is zeroed
+
+    def __init__(self, kp: float = 0.01, ki: float = 0.0, kd: float = 0.0,
+                 max_output: float = 0.5, decel_zone_deg: float = 15.0) -> None:
+        self.kp = kp
+        self.ki = ki
+        self.kd = kd
+        self.max_output = max_output
+        self.decel_zone_deg = decel_zone_deg
+        self.setpoint_deg: float = 0.0
+        self.active: bool = False
+        self._loop = _PIDLoop()
+
+    @staticmethod
+    def _ticks_to_deg(ticks: float) -> float:
+        return ticks * (360.0 / ARM_TICKS_PER_REV)
+
+    @staticmethod
+    def _deg_to_ticks(deg: float) -> float:
+        return deg * (ARM_TICKS_PER_REV / 360.0)
+
+    def reset(self) -> None:
+        self._loop.reset()
+
+    def set_setpoint_degrees(self, degrees: float) -> None:
+        self.setpoint_deg = float(degrees)
+        self.reset()
+        self.active = True
+
+    def disable(self) -> None:
+        self.active = False
+        self.reset()
+
+    def compute(self, encoder_ticks: float) -> float:
+        """Return motor output in [-max_output, max_output]."""
+        current_deg = self._ticks_to_deg(encoder_ticks)
+        error_deg = self.setpoint_deg - current_deg
+
+        if abs(error_deg) <= self.TOLERANCE_DEG:
+            self._loop.last_output = 0.0
+            self._loop.current_pos = current_deg
+            return 0.0
+
+        decel_zone_ticks = self._deg_to_ticks(self.decel_zone_deg) if self.decel_zone_deg > 0 else 0.0
+        return self._loop.compute(
+            current_pos=self._deg_to_ticks(current_deg),
+            setpoint=self._deg_to_ticks(self.setpoint_deg),
+            kp=self.kp,
+            ki=self.ki,
+            kd=self.kd,
+            max_output=self.max_output,
+            decel_zone=decel_zone_ticks,
+        )
+
+    def current_deg(self, encoder_ticks: float) -> float:
+        return self._ticks_to_deg(encoder_ticks)
+
+    def as_dict(self, encoder_ticks: float = 0.0) -> dict:
+        current = self._ticks_to_deg(encoder_ticks)
+        return {
+            "active": self.active,
+            "kp": self.kp,
+            "ki": self.ki,
+            "kd": self.kd,
+            "max_output": self.max_output,
+            "decel_zone_deg": self.decel_zone_deg,
+            "setpoint_deg": self.setpoint_deg,
+            "current_deg": current,
+            "output": self._loop.last_output,
+        }
 
 
 class RobotServer:
@@ -162,7 +396,10 @@ class RobotServer:
             "step_start_pose": None,
             "last_error": None,
         }
-    
+
+        self.elevator_pid = ElevatorPID()
+        self.arm_pid = ArmPID()
+
         self.telemetry_data: Dict[str, Any] = {
             "battery": 12.5,
             "mode": robot_mode,
@@ -195,6 +432,8 @@ class RobotServer:
                 "bridge_connected": False,
             },
             "auto": self._build_auto_status(),
+            "elevator": self.elevator_pid.as_dict(),
+            "arm": self.arm_pid.as_dict(),
         }
     
         try:
@@ -216,15 +455,63 @@ class RobotServer:
     def all_stop(self) -> None:
         """Emergency stop for both MCU-backed and local motor control paths."""
         global connection_lost, robot_mode
-    
+
         if not connection_lost:
             logger.warning("!!!! CONNECTION LOST - EMERGENCY STOP !!!!")
-    
+
         connection_lost = True
         robot_mode = "STOPPED"
         self._cancel_auto("Emergency stop")
+        self.elevator_pid.disable()
+        self.arm_pid.disable()
         self._stop_drive()
         self.telemetry_data["mode"] = robot_mode
+
+    # Both encoders count in the same direction for the same physical elevator
+    # motion, so no sign correction is needed on the encoder reading.
+    # However, the right motor is wired/mounted opposite to the left, so its
+    # command must be negated to produce the same physical direction.
+    _ELEV_RIGHT_ENC_SIGN = 1
+    _ELEV_RIGHT_MOTOR_SIGN = -1
+
+    def _update_elevator_pid(self) -> None:
+        """Read elevator encoders and drive mech motors via PID. No-op if inactive."""
+        if not self.elevator_pid.active:
+            return
+        if not self.bridge:
+            return
+
+        encoders = self.telemetry_data.get("encoders", [])
+        if len(encoders) < 6:
+            return
+
+        left_pos = float(encoders[4])
+        right_pos = self._ELEV_RIGHT_ENC_SIGN * float(encoders[5])
+
+        output = self.elevator_pid.compute(left_pos, right_pos)
+
+        mech = self.telemetry_data.get("mcu", {}).get("mech_cmd", [0.0, 0.0, 0.0])
+        arm_speed = float(mech[2]) if len(mech) > 2 else 0.0
+        self.bridge.set_mech_motors([output, self._ELEV_RIGHT_MOTOR_SIGN * output, arm_speed])
+
+    def _update_arm_pid(self) -> None:
+        """Read arm encoder (index 6) and drive mech motor[2] via PID. No-op if inactive."""
+        if not self.arm_pid.active:
+            return
+        if not self.bridge:
+            return
+
+        encoders = self.telemetry_data.get("encoders", [])
+        if len(encoders) < 7:
+            return
+
+        ticks = float(encoders[6])
+        output = self.arm_pid.compute(ticks)
+
+        mech = self.telemetry_data.get("mcu", {}).get("mech_cmd", [0.0, 0.0, 0.0])
+        elev_l = float(mech[0]) if len(mech) > 0 else 0.0
+        elev_r = float(mech[1]) if len(mech) > 1 else 0.0
+        self.bridge.set_mech_motors([elev_l, elev_r, output])
 
     def _stop_drive(self) -> None:
         """Stop all drivetrain/mechanism outputs."""
@@ -812,6 +1099,109 @@ class RobotServer:
                 logger.info("Alliance set to: %s", self.alliance)
                 return {"status": "success", "alliance": self.alliance}
 
+            elif cmd_type == "elevator_setpoint":
+                setpoint = float(command.get("setpoint", 0))
+                self.elevator_pid.set_setpoint(setpoint)
+                self.telemetry_data["elevator"] = self.elevator_pid.as_dict()
+                logger.info("Elevator setpoint: %.0f ticks", setpoint)
+                return {"status": "success", "elevator": self.elevator_pid.as_dict()}
+
+            elif cmd_type == "elevator_pid":
+                if "kp" in command:
+                    self.elevator_pid.kp = float(command["kp"])
+                if "ki" in command:
+                    self.elevator_pid.ki = float(command["ki"])
+                if "kd" in command:
+                    self.elevator_pid.kd = float(command["kd"])
+                if "max_output" in command:
+                    self.elevator_pid.max_output = float(command["max_output"])
+                if "decel_zone" in command:
+                    self.elevator_pid.decel_zone = float(command["decel_zone"])
+                self.elevator_pid.reset()
+                self.telemetry_data["elevator"] = self.elevator_pid.as_dict()
+                logger.info("Elevator PID gains updated: kp=%.4f ki=%.4f kd=%.4f",
+                            self.elevator_pid.kp, self.elevator_pid.ki, self.elevator_pid.kd)
+                return {"status": "success", "elevator": self.elevator_pid.as_dict()}
+
+            elif cmd_type == "elevator_manual":
+                left = max(-1.0, min(1.0, float(command.get("left", 0.0))))
+                right = self._ELEV_RIGHT_MOTOR_SIGN * max(-1.0, min(1.0, float(command.get("right", 0.0))))
+                self.elevator_pid.disable()
+                self.telemetry_data["elevator"] = self.elevator_pid.as_dict()
+                if self.bridge:
+                    mech = self.telemetry_data.get("mcu", {}).get("mech_cmd", [0.0, 0.0, 0.0])
+                    arm_speed = float(mech[2]) if len(mech) > 2 else 0.0
+                    self.bridge.set_mech_motors([left, right, arm_speed])
+                logger.info("Elevator manual: left=%.2f right=%.2f", left, right)
+                return {"status": "success"}
+
+            elif cmd_type == "elevator_disable":
+                self.elevator_pid.disable()
+                self.telemetry_data["elevator"] = self.elevator_pid.as_dict()
+                if self.bridge:
+                    mech = self.telemetry_data.get("mcu", {}).get("mech_cmd", [0.0, 0.0, 0.0])
+                    arm_speed = float(mech[2]) if len(mech) > 2 else 0.0
+                    self.bridge.set_mech_motors([0.0, 0.0, arm_speed])
+                logger.info("Elevator PID disabled")
+                return {"status": "success"}
+
+            # ── Arm PID commands ──────────────────────────────────────────────
+
+            elif cmd_type == "arm_setpoint":
+                degrees = float(command.get("degrees", 0.0))
+                self.arm_pid.set_setpoint_degrees(degrees)
+                encoders = self.telemetry_data.get("encoders", [])
+                ticks = float(encoders[6]) if len(encoders) > 6 else 0.0
+                self.telemetry_data["arm"] = self.arm_pid.as_dict(ticks)
+                logger.info("Arm setpoint: %.1f deg", degrees)
+                return {"status": "success", "arm": self.telemetry_data["arm"]}
+
+            elif cmd_type == "arm_pid":
+                if "kp" in command:
+                    self.arm_pid.kp = float(command["kp"])
+                if "ki" in command:
+                    self.arm_pid.ki = float(command["ki"])
+                if "kd" in command:
+                    self.arm_pid.kd = float(command["kd"])
+                if "max_output" in command:
+                    self.arm_pid.max_output = float(command["max_output"])
+                if "decel_zone_deg" in command:
+                    self.arm_pid.decel_zone_deg = float(command["decel_zone_deg"])
+                self.arm_pid.reset()
+                encoders = self.telemetry_data.get("encoders", [])
+                ticks = float(encoders[6]) if len(encoders) > 6 else 0.0
+                self.telemetry_data["arm"] = self.arm_pid.as_dict(ticks)
+                logger.info("Arm PID gains: kp=%.4f ki=%.4f kd=%.4f",
+                            self.arm_pid.kp, self.arm_pid.ki, self.arm_pid.kd)
+                return {"status": "success", "arm": self.telemetry_data["arm"]}
+
+            elif cmd_type == "arm_manual":
+                speed = max(-1.0, min(1.0, float(command.get("speed", 0.0))))
+                self.arm_pid.disable()
+                if self.bridge:
+                    mech = self.telemetry_data.get("mcu", {}).get("mech_cmd", [0.0, 0.0, 0.0])
+                    elev_l = float(mech[0]) if len(mech) > 0 else 0.0
+                    elev_r = float(mech[1]) if len(mech) > 1 else 0.0
+                    self.bridge.set_mech_motors([elev_l, elev_r, speed])
+                encoders = self.telemetry_data.get("encoders", [])
+                ticks = float(encoders[6]) if len(encoders) > 6 else 0.0
+                self.telemetry_data["arm"] = self.arm_pid.as_dict(ticks)
+                logger.info("Arm manual: speed=%.2f", speed)
+                return {"status": "success"}
+
+            elif cmd_type == "arm_disable":
+                self.arm_pid.disable()
+                if self.bridge:
+                    mech = self.telemetry_data.get("mcu", {}).get("mech_cmd", [0.0, 0.0, 0.0])
+                    elev_l = float(mech[0]) if len(mech) > 0 else 0.0
+                    elev_r = float(mech[1]) if len(mech) > 1 else 0.0
+                    self.bridge.set_mech_motors([elev_l, elev_r, 0.0])
+                encoders = self.telemetry_data.get("encoders", [])
+                ticks = float(encoders[6]) if len(encoders) > 6 else 0.0
+                self.telemetry_data["arm"] = self.arm_pid.as_dict(ticks)
+                logger.info("Arm PID disabled")
+                return {"status": "success"}
+
             else:
                 logger.warning(f"Unknown command: {cmd_type}")
                 return {"status": "error", "message": f"Unknown command: {cmd_type}"}
@@ -869,6 +1259,14 @@ class RobotServer:
                     self.telemetry_data["encoders"] = []
                     self.telemetry_data["relay"] = 0
 
+                self._update_elevator_pid()
+                self.telemetry_data["elevator"] = self.elevator_pid.as_dict()
+
+                self._update_arm_pid()
+                encoders = self.telemetry_data.get("encoders", [])
+                arm_ticks = float(encoders[6]) if len(encoders) > 6 else 0.0
+                self.telemetry_data["arm"] = self.arm_pid.as_dict(arm_ticks)
+
                 self.telemetry_socket.send_json(self.telemetry_data)
                 time.sleep(1.0 / TELEMETRY_RATE_HZ)
 
@@ -887,6 +1285,14 @@ class RobotServer:
             name="watchdog",
         )
         watchdog.start()
+
+        signal_light = threading.Thread(
+            target=signal_light_thread,
+            args=(self,),
+            daemon=True,
+            name="signal-light",
+        )
+        signal_light.start()
 
         telemetry_thread = threading.Thread(
             target=self.telemetry_loop,
