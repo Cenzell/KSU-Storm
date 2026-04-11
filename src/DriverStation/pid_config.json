@@ -1,0 +1,43 @@
+{
+  "elevator": {
+    "kp": 0.002,
+    "ki": 0.0,
+    "kd": 0.0,
+    "max_out": 0.6,
+    "decel_zone": 800
+  },
+  "arm": {
+    "kp": 0.01,
+    "ki": 0.0,
+    "kd": 0.0,
+    "max_out": 0.5,
+    "decel_zone": 15.0
+  },
+  "claw": {
+    "open": -1.0,
+    "closed": 1.0,
+    "target": "open"
+  },
+  "position_presets": {
+    "LB": {
+      "name": "Left Score",
+      "elevator": -500,
+      "arm": 0.0
+    },
+    "LT": {
+      "name": "Ground Position",
+      "elevator": 0,
+      "arm": 0.0
+    },
+    "RT": {
+      "name": "Full Extension",
+      "elevator": 0,
+      "arm": 0.0
+    },
+    "RB": {
+      "name": "Right Score",
+      "elevator": 0,
+      "arm": 0.0
+    }
+  }
+}

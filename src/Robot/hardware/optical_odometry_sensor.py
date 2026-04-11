@@ -36,3 +36,11 @@ class OpticalOdometrySensor:
             "y_in": float(position.y),
             "heading_deg": float(position.h),
         }
+
+    def read_velocity(self) -> Dict[str, float]:
+        velocity: Any = self.sensor.getVelocity()
+        return {
+            "vx_in_s": float(velocity.x),
+            "vy_in_s": float(velocity.y),
+            "vh_deg_s": float(velocity.h),
+        }

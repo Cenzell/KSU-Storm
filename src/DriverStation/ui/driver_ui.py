@@ -853,6 +853,29 @@ class DriverUIHelpers:
         actions_layout.addStretch(1)
         layout.addWidget(actions_group, 3, 2)
 
+        rotation_group = QGroupBox("Rotation Rate (OTOS)")
+        rotation_layout = QVBoxLayout(rotation_group)
+
+        self.odo_tab_rotation_raw_label = QLabel("Raw:       +0.000 °/s")
+        self.odo_tab_rotation_corrected_label = QLabel("Corrected: +0.000 °/s")
+        rotation_layout.addWidget(self.odo_tab_rotation_raw_label)
+        rotation_layout.addWidget(self.odo_tab_rotation_corrected_label)
+
+        offset_row = QHBoxLayout()
+        offset_row.addWidget(QLabel("Offset:"))
+        self.odo_tab_gyro_offset_spin = QDoubleSpinBox()
+        self.odo_tab_gyro_offset_spin.setRange(-50.0, 50.0)
+        self.odo_tab_gyro_offset_spin.setDecimals(3)
+        self.odo_tab_gyro_offset_spin.setSingleStep(0.01)
+        self.odo_tab_gyro_offset_spin.setSuffix("  °/s")
+        self.odo_tab_gyro_offset_spin.setValue(0.0)
+        offset_row.addWidget(self.odo_tab_gyro_offset_spin)
+        self.odo_tab_gyro_offset_apply_btn = QPushButton("Apply")
+        offset_row.addWidget(self.odo_tab_gyro_offset_apply_btn)
+        rotation_layout.addLayout(offset_row)
+
+        layout.addWidget(rotation_group, 4, 2)
+
         self.main_tabs.addTab(self.odometry_tab, "Odometry")
 
     def setup_mechanism_tab(self):
@@ -1114,6 +1137,85 @@ class DriverUIHelpers:
         arm_manual_outer.addLayout(arm_btn_col)
 
         vlayout.addWidget(arm_manual_group)
+
+        # ── Claw Servo ───────────────────────────────────────────────────────
+        claw_group = QGroupBox("Claw Servo")
+        claw_outer = QHBoxLayout(claw_group)
+
+        claw_setpoints_layout = QGridLayout()
+        claw_setpoints_layout.addWidget(QLabel("Open Setpoint:"), 0, 0)
+        self.claw_open_spin = QDoubleSpinBox()
+        self.claw_open_spin.setDecimals(3)
+        self.claw_open_spin.setRange(-1.0, 1.0)
+        self.claw_open_spin.setSingleStep(0.05)
+        self.claw_open_spin.setValue(-1.0)
+        claw_setpoints_layout.addWidget(self.claw_open_spin, 0, 1)
+        self.claw_open_btn = QPushButton("Open")
+        claw_setpoints_layout.addWidget(self.claw_open_btn, 0, 2)
+
+        claw_setpoints_layout.addWidget(QLabel("Closed Setpoint:"), 1, 0)
+        self.claw_closed_spin = QDoubleSpinBox()
+        self.claw_closed_spin.setDecimals(3)
+        self.claw_closed_spin.setRange(-1.0, 1.0)
+        self.claw_closed_spin.setSingleStep(0.05)
+        self.claw_closed_spin.setValue(1.0)
+        claw_setpoints_layout.addWidget(self.claw_closed_spin, 1, 1)
+        self.claw_closed_btn = QPushButton("Close")
+        claw_setpoints_layout.addWidget(self.claw_closed_btn, 1, 2)
+
+        claw_outer.addLayout(claw_setpoints_layout)
+
+        claw_status_layout = QVBoxLayout()
+        self.claw_target_label = QLabel("Target: Open")
+        self.claw_setpoint_label = QLabel("Setpoint: -1.000")
+        self.claw_hint_label = QLabel("Gamepad: Square toggles open/closed")
+        for lbl in (self.claw_target_label, self.claw_setpoint_label, self.claw_hint_label):
+            claw_status_layout.addWidget(lbl)
+        claw_status_layout.addStretch(1)
+        claw_outer.addLayout(claw_status_layout)
+
+        vlayout.addWidget(claw_group)
+
+        # ── Position Presets (trigger / bumper) ───────────────────────────────
+        presets_group = QGroupBox("Position Presets (Gamepad)")
+        presets_grid = QGridLayout(presets_group)
+        presets_grid.addWidget(QLabel("<b>Button</b>"),           0, 0)
+        presets_grid.addWidget(QLabel("<b>Name</b>"),             0, 1)
+        presets_grid.addWidget(QLabel("<b>Elevator (ticks)</b>"), 0, 2)
+        presets_grid.addWidget(QLabel("<b>Arm (°)</b>"),          0, 3)
+
+        self.position_preset_elev_spins = {}
+        self.position_preset_arm_spins = {}
+        self.position_preset_name_edits = {}
+        self.position_preset_go_btns = {}
+
+        for row, key in enumerate(["LB", "LT", "RT", "RB"], start=1):
+            presets_grid.addWidget(QLabel(f"<b>{key}</b>"), row, 0)
+
+            name_edit = QLineEdit()
+            name_edit.setPlaceholderText("Position name...")
+            presets_grid.addWidget(name_edit, row, 1)
+            self.position_preset_name_edits[key] = name_edit
+
+            elev_spin = QSpinBox()
+            elev_spin.setRange(-100000, 100000)
+            elev_spin.setValue(0)
+            presets_grid.addWidget(elev_spin, row, 2)
+            self.position_preset_elev_spins[key] = elev_spin
+
+            arm_spin = QDoubleSpinBox()
+            arm_spin.setDecimals(1)
+            arm_spin.setRange(-720.0, 720.0)
+            arm_spin.setSingleStep(5.0)
+            arm_spin.setValue(0.0)
+            presets_grid.addWidget(arm_spin, row, 3)
+            self.position_preset_arm_spins[key] = arm_spin
+
+            go_btn = QPushButton("Go")
+            presets_grid.addWidget(go_btn, row, 4)
+            self.position_preset_go_btns[key] = go_btn
+
+        vlayout.addWidget(presets_group)
         vlayout.addStretch(1)
 
         scroll.setWidget(content)

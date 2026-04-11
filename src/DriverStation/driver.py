@@ -3,6 +3,7 @@ import sys
 import time
 import logging
 import math
+import json
 from pathlib import Path
 import pygame
 from PyQt6.QtWidgets import QApplication, QMainWindow
@@ -15,6 +16,7 @@ PROJECT_ROOT = BASE_DIR.parents[1]
 LIB_DIR = PROJECT_ROOT / "lib"
 UI_DIR = BASE_DIR / "ui"
 UI_FILE = UI_DIR / "driver_station.ui"
+PID_CONFIG_FILE = BASE_DIR / "pid_config.json"
 
 for path in (LIB_DIR, UI_DIR):
     path_str = str(path)
@@ -48,6 +50,20 @@ FACE_BUTTON_COLORS = {
     2: "blue",    # X
     3: "purple",  # Y
 }
+CLAW_TOGGLE_BUTTON = 2  # Square on many PlayStation layouts, X on Xbox-style layouts
+CLAW_SERVO_CHANNEL = 0
+
+# Gamepad button indices for bumper presets (LB=4, RB=5 on most Xbox/generic controllers)
+PRESET_BUTTON_MAP = {
+    4: "LB",
+    5: "RB",
+}
+# Trigger axes (LT=axis 2, RT=axis 5 on most Xbox controllers; range -1.0 unpressed to 1.0 fully pressed)
+TRIGGER_AXIS_MAP = {
+    2: "LT",
+    5: "RT",
+}
+TRIGGER_THRESHOLD = 0.5  # axis value above which a trigger counts as "pressed"
 
 
 class AppWindow(DriverUIHelpers, QMainWindow):
@@ -117,6 +133,9 @@ class AppWindow(DriverUIHelpers, QMainWindow):
         self.current_auto_status = {"active": False, "status": "idle"}
         self._last_diagnostic_telemetry_time = 0.0
         self._last_diagnostic_controls = None
+        # Track trigger press state so we only fire once per press, not every poll tick
+        self._trigger_pressed = {"LT": False, "RT": False}
+        self._claw_target_key = "open"
 
         # Add field view to odometry panel
         self.setup_field_view()
@@ -147,6 +166,8 @@ class AppWindow(DriverUIHelpers, QMainWindow):
             self.pushButton.clicked.connect(self.reset_odometry)
         if hasattr(self, 'odo_tab_reset_button'):
             self.odo_tab_reset_button.clicked.connect(self.reset_odometry)
+        if hasattr(self, 'odo_tab_gyro_offset_apply_btn'):
+            self.odo_tab_gyro_offset_apply_btn.clicked.connect(self.send_gyro_offset)
         if hasattr(self, 'btn_odo_optical'):
             self.btn_odo_optical.clicked.connect(lambda: self.set_odometry_mode("OPTICAL"))
         if hasattr(self, 'btn_odo_motor'):
@@ -199,6 +220,27 @@ class AppWindow(DriverUIHelpers, QMainWindow):
             self.arm_manual_send_btn.clicked.connect(self.send_arm_manual)
         if hasattr(self, "arm_manual_stop_btn"):
             self.arm_manual_stop_btn.clicked.connect(self.stop_arm_manual)
+
+        # Claw servo controls
+        if hasattr(self, "claw_open_btn"):
+            self.claw_open_btn.clicked.connect(self.send_claw_open)
+        if hasattr(self, "claw_closed_btn"):
+            self.claw_closed_btn.clicked.connect(self.send_claw_closed)
+        if hasattr(self, "claw_open_spin"):
+            self.claw_open_spin.editingFinished.connect(self.save_pid_config)
+        if hasattr(self, "claw_closed_spin"):
+            self.claw_closed_spin.editingFinished.connect(self.save_pid_config)
+
+        # Position preset Go buttons and auto-save on setpoint/name change
+        if hasattr(self, "position_preset_go_btns"):
+            for key, btn in self.position_preset_go_btns.items():
+                btn.clicked.connect(lambda checked, k=key: self._send_position_preset(k))
+            for key in self.position_preset_elev_spins:
+                self.position_preset_elev_spins[key].editingFinished.connect(self.save_pid_config)
+                self.position_preset_arm_spins[key].editingFinished.connect(self.save_pid_config)
+            if hasattr(self, "position_preset_name_edits"):
+                for key in self.position_preset_name_edits:
+                    self.position_preset_name_edits[key].editingFinished.connect(self.save_pid_config)
         
         # Setup keyboard speed slider if it exists in UI
         if hasattr(self, 'keyboard_speed_slider'):
@@ -218,6 +260,7 @@ class AppWindow(DriverUIHelpers, QMainWindow):
         self._update_network_status_labels(False, "N/A")
         self._refresh_auto_selection_ui()
         self._update_auto_status_labels({"active": False, "status": "idle"})
+        self.load_pid_config()
 
     def _alliance_start_pose(self):
         half_robot = 18.0 * 0.0254 / 2.0
@@ -481,12 +524,9 @@ class AppWindow(DriverUIHelpers, QMainWindow):
         logger.info("FMS voltage required: %sV", voltage)
         self.append_diagnostic("connection", f"FMS voltage required: {voltage}V")
 
-        # ── future circuit integration ──────────────────────────────────────
-        # Fill in once circuit specs/wiring are available:
-        #
-        #   if voltage > 0 and hasattr(self, "serial_bridge"):
-        #       self.serial_bridge.send_voltage(voltage)
-        # ───────────────────────────────────────────────────────────────────
+        # §4.4.9 — forward voltage level to robot so it can enable/disable
+        # the output relay.  voltage=0 means no active match → disable output.
+        self.cmd_worker.enqueue("voltage", voltage=voltage)
 
     def _on_fms_rpm_required(self, rpm: float) -> None:
         """Called only when the required grid frequency (RPM) changes.
@@ -506,16 +546,16 @@ class AppWindow(DriverUIHelpers, QMainWindow):
     JUMPSTART_COOLDOWN_S = 30
 
     def trigger_jumpstart(self) -> None:
-        """Start a 30-second cooldown after a Jumpstart Grid attempt (§3.3.5)."""
-        if self._jumpstart_cooldown_remaining > 0:
-            self.append_diagnostic("controls",
-                f"Jumpstart blocked — cooldown {self._jumpstart_cooldown_remaining}s remaining")
-            return
+        """Trigger a Jumpstart Grid attempt and restart the 30-second cooldown (§3.3.5).
 
+        The button stays enabled during the cooldown so operators can re-trigger
+        immediately if the first attempt missed.  Each press resets the timer.
+        """
         self._jumpstart_cooldown_remaining = self.JUMPSTART_COOLDOWN_S
         self._update_jumpstart_ui()
-        self._jumpstart_cooldown_timer.start()
-        self.append_diagnostic("controls", "Jumpstart triggered — 30 s cooldown started")
+        if not self._jumpstart_cooldown_timer.isActive():
+            self._jumpstart_cooldown_timer.start()
+        self.append_diagnostic("controls", "Jumpstart triggered — 30 s cooldown restarted")
 
     def _tick_jumpstart_cooldown(self) -> None:
         self._jumpstart_cooldown_remaining -= 1
@@ -533,7 +573,6 @@ class AppWindow(DriverUIHelpers, QMainWindow):
         if hasattr(self, "voltage_stack"):
             self.voltage_stack.setCurrentIndex(1)  # show cooldown overlay
         if hasattr(self, "jumpstart_btn"):
-            self.jumpstart_btn.setEnabled(False)
             self.jumpstart_btn.setStyleSheet(
                 "font-weight: bold; font-size: 13px;"
                 "background: rgb(80, 40, 40); color: rgb(160, 100, 100); border-radius: 4px;"
@@ -660,12 +699,118 @@ class AppWindow(DriverUIHelpers, QMainWindow):
         if self.conn_manager.get_client() is not None:
             self.cmd_worker.enqueue("odometry_mode", mode=mode)
 
+    def _send_position_preset(self, name: str):
+        if not hasattr(self, "position_preset_elev_spins"):
+            return
+        elev_ticks = self.position_preset_elev_spins[name].value()
+        arm_deg = self.position_preset_arm_spins[name].value()
+        self.append_diagnostic("telemetry",
+            f"Position preset '{name}': elevator={elev_ticks} ticks, arm={arm_deg}°")
+        if self.conn_manager.get_client() is not None:
+            self.cmd_worker.enqueue("elevator_setpoint", setpoint=float(elev_ticks))
+            self.cmd_worker.enqueue("arm_setpoint", degrees=float(arm_deg))
+        if hasattr(self, "elev_setpoint_spin"):
+            self.elev_setpoint_spin.setValue(elev_ticks)
+        if hasattr(self, "arm_setpoint_spin"):
+            self.arm_setpoint_spin.setValue(arm_deg)
+
+    def load_pid_config(self):
+        if not PID_CONFIG_FILE.exists():
+            return
+        try:
+            with open(PID_CONFIG_FILE, "r") as f:
+                cfg = json.load(f)
+            elev = cfg.get("elevator", {})
+            if hasattr(self, "elev_kp_spin") and "kp" in elev:
+                self.elev_kp_spin.setValue(elev["kp"])
+            if hasattr(self, "elev_ki_spin") and "ki" in elev:
+                self.elev_ki_spin.setValue(elev["ki"])
+            if hasattr(self, "elev_kd_spin") and "kd" in elev:
+                self.elev_kd_spin.setValue(elev["kd"])
+            if hasattr(self, "elev_max_out_spin") and "max_out" in elev:
+                self.elev_max_out_spin.setValue(elev["max_out"])
+            if hasattr(self, "elev_decel_zone_spin") and "decel_zone" in elev:
+                self.elev_decel_zone_spin.setValue(elev["decel_zone"])
+            arm = cfg.get("arm", {})
+            if hasattr(self, "arm_kp_spin") and "kp" in arm:
+                self.arm_kp_spin.setValue(arm["kp"])
+            if hasattr(self, "arm_ki_spin") and "ki" in arm:
+                self.arm_ki_spin.setValue(arm["ki"])
+            if hasattr(self, "arm_kd_spin") and "kd" in arm:
+                self.arm_kd_spin.setValue(arm["kd"])
+            if hasattr(self, "arm_max_out_spin") and "max_out" in arm:
+                self.arm_max_out_spin.setValue(arm["max_out"])
+            if hasattr(self, "arm_decel_zone_spin") and "decel_zone" in arm:
+                self.arm_decel_zone_spin.setValue(arm["decel_zone"])
+            claw = cfg.get("claw", {})
+            if hasattr(self, "claw_open_spin") and "open" in claw:
+                self.claw_open_spin.setValue(claw["open"])
+            if hasattr(self, "claw_closed_spin") and "closed" in claw:
+                self.claw_closed_spin.setValue(claw["closed"])
+            target = str(claw.get("target", self._claw_target_key)).lower()
+            if target in {"open", "closed"}:
+                self._claw_target_key = target
+            self._update_claw_labels(self._claw_target_key, self._claw_value_for_target(self._claw_target_key))
+            presets = cfg.get("position_presets", {})
+            if hasattr(self, "position_preset_elev_spins"):
+                for key, elev_spin in self.position_preset_elev_spins.items():
+                    if key in presets:
+                        elev_spin.setValue(presets[key].get("elevator", 0))
+                        self.position_preset_arm_spins[key].setValue(
+                            presets[key].get("arm", 0.0))
+                        if hasattr(self, "position_preset_name_edits"):
+                            self.position_preset_name_edits[key].setText(
+                                presets[key].get("name", ""))
+            logger.info("PID config loaded from %s", PID_CONFIG_FILE)
+        except Exception as e:
+            logger.warning("Failed to load PID config: %s", e)
+
+    def save_pid_config(self):
+        try:
+            presets = {}
+            if hasattr(self, "position_preset_elev_spins"):
+                for key, elev_spin in self.position_preset_elev_spins.items():
+                    presets[key] = {
+                        "name": self.position_preset_name_edits[key].text()
+                            if hasattr(self, "position_preset_name_edits") else "",
+                        "elevator": elev_spin.value(),
+                        "arm": self.position_preset_arm_spins[key].value(),
+                    }
+            cfg = {
+                "elevator": {
+                    "kp": self.elev_kp_spin.value(),
+                    "ki": self.elev_ki_spin.value(),
+                    "kd": self.elev_kd_spin.value(),
+                    "max_out": self.elev_max_out_spin.value(),
+                    "decel_zone": self.elev_decel_zone_spin.value(),
+                },
+                "arm": {
+                    "kp": self.arm_kp_spin.value(),
+                    "ki": self.arm_ki_spin.value(),
+                    "kd": self.arm_kd_spin.value(),
+                    "max_out": self.arm_max_out_spin.value(),
+                    "decel_zone": self.arm_decel_zone_spin.value(),
+                },
+                "claw": {
+                    "open": self.claw_open_spin.value() if hasattr(self, "claw_open_spin") else -1.0,
+                    "closed": self.claw_closed_spin.value() if hasattr(self, "claw_closed_spin") else 1.0,
+                    "target": self._claw_target_key,
+                },
+                "position_presets": presets,
+            }
+            with open(PID_CONFIG_FILE, "w") as f:
+                json.dump(cfg, f, indent=2)
+            logger.info("PID config saved to %s", PID_CONFIG_FILE)
+        except Exception as e:
+            logger.warning("Failed to save PID config: %s", e)
+
     def send_elevator_gains(self):
         kp = self.elev_kp_spin.value()
         ki = self.elev_ki_spin.value()
         kd = self.elev_kd_spin.value()
         max_out = self.elev_max_out_spin.value()
         decel_zone = self.elev_decel_zone_spin.value()
+        self.save_pid_config()
         self.append_diagnostic("telemetry",
             f"Elevator PID gains: kP={kp} kI={ki} kD={kd} maxOut={max_out} decelZone={decel_zone}")
         if self.conn_manager.get_client() is not None:
@@ -719,6 +864,7 @@ class AppWindow(DriverUIHelpers, QMainWindow):
         kd = self.arm_kd_spin.value()
         max_out = self.arm_max_out_spin.value()
         decel_zone = self.arm_decel_zone_spin.value()
+        self.save_pid_config()
         self.append_diagnostic("telemetry",
             f"Arm PID gains: kP={kp} kI={ki} kD={kd} maxOut={max_out} decelZone={decel_zone}°")
         if self.conn_manager.get_client() is not None:
@@ -761,6 +907,46 @@ class AppWindow(DriverUIHelpers, QMainWindow):
         if hasattr(self, "arm_status_label"):
             self.arm_status_label.setText("PID: Inactive")
 
+    # ── Claw servo controls ──────────────────────────────────────────────────
+
+    def _claw_value_for_target(self, target_key: str) -> float:
+        if target_key == "closed" and hasattr(self, "claw_closed_spin"):
+            return float(self.claw_closed_spin.value())
+        if hasattr(self, "claw_open_spin"):
+            return float(self.claw_open_spin.value())
+        return -1.0 if target_key != "closed" else 1.0
+
+    def _update_claw_labels(self, target_key: str, value: float):
+        title = "Closed" if target_key == "closed" else "Open"
+        if hasattr(self, "claw_target_label"):
+            self.claw_target_label.setText(f"Target: {title}")
+        if hasattr(self, "claw_setpoint_label"):
+            self.claw_setpoint_label.setText(f"Setpoint: {value:.3f}")
+
+    def _send_claw_target(self, target_key: str):
+        value = self._claw_value_for_target(target_key)
+        self._claw_target_key = target_key
+        self.save_pid_config()
+        self._update_claw_labels(target_key, value)
+        self.append_diagnostic("telemetry", f"Claw {target_key}: {value:.3f}")
+        if self.conn_manager.get_client() is not None:
+            self.cmd_worker.enqueue(
+                "claw_setpoint",
+                channel=CLAW_SERVO_CHANNEL,
+                value=float(value),
+                target=target_key,
+            )
+
+    def send_claw_open(self):
+        self._send_claw_target("open")
+
+    def send_claw_closed(self):
+        self._send_claw_target("closed")
+
+    def toggle_claw_target(self):
+        next_target = "closed" if self._claw_target_key != "closed" else "open"
+        self._send_claw_target(next_target)
+
     def reset_odometry(self):
         """Reset odometry pose on robot and local field widget."""
         logger.info("Odometry reset requested")
@@ -777,6 +963,14 @@ class AppWindow(DriverUIHelpers, QMainWindow):
             self.odometry_field_widget.set_expected_pose(start_x, start_y, start_theta)
         self.update_odometry_labels(start_x, start_y, start_theta)
     
+    def send_gyro_offset(self) -> None:
+        """Send the operator-entered angular velocity offset to the robot."""
+        if not hasattr(self, "odo_tab_gyro_offset_spin"):
+            return
+        offset = self.odo_tab_gyro_offset_spin.value()
+        self.cmd_worker.enqueue("gyro_offset", offset_dps=offset)
+        self.append_diagnostic("controls", f"Gyro offset set to {offset:+.3f} °/s")
+
     def set_auto_mode(self):
         """Switch robot to autonomous mode."""
         if self.run_selected_auto():
@@ -973,6 +1167,18 @@ class AppWindow(DriverUIHelpers, QMainWindow):
             arm = data.get("arm")
             if arm is not None:
                 self._update_arm_labels(arm)
+            claw = data.get("claw")
+            if claw is not None:
+                target = str(claw.get("target", self._claw_target_key)).lower()
+                value = float(claw.get("setpoint", self._claw_value_for_target(target)))
+                if target in {"open", "closed"}:
+                    self._claw_target_key = target
+                self._update_claw_labels(self._claw_target_key, value)
+
+            sensors = data.get("sensors", {})
+            otos = sensors.get("optical_odometry", {})
+            if otos:
+                self._update_rotation_rate_labels(otos)
         except Exception as e:
             logger.error(f"Error parsing telemetry pose: {e}")
             self.append_diagnostic("telemetry", f"Telemetry parse error: {e}")
@@ -1012,6 +1218,21 @@ class AppWindow(DriverUIHelpers, QMainWindow):
             self.arm_setpoint_label.setText(f"Setpoint: {setpoint:.1f}°")
         if hasattr(self, "arm_output_label"):
             self.arm_output_label.setText(f"Output: {output:.3f}")
+
+    def _update_rotation_rate_labels(self, otos: dict) -> None:
+        raw = float(otos.get("vh_deg_s", 0.0))
+        corrected = float(otos.get("vh_deg_s_corrected", 0.0))
+        if hasattr(self, "odo_tab_rotation_raw_label"):
+            self.odo_tab_rotation_raw_label.setText(f"Raw:       {raw:+.3f} °/s")
+        if hasattr(self, "odo_tab_rotation_corrected_label"):
+            self.odo_tab_rotation_corrected_label.setText(f"Corrected: {corrected:+.3f} °/s")
+        # Sync the spinbox to reflect the current server-side offset without retriggering.
+        if hasattr(self, "odo_tab_gyro_offset_spin"):
+            offset = float(otos.get("angular_vel_offset_dps", 0.0))
+            spin = self.odo_tab_gyro_offset_spin
+            spin.blockSignals(True)
+            spin.setValue(offset)
+            spin.blockSignals(False)
 
     def update_keyboard_speed(self, value):
         """Update keyboard speed from slider."""
@@ -1196,10 +1417,23 @@ class AppWindow(DriverUIHelpers, QMainWindow):
                         self.cmd_worker.enqueue("button", button_id=event.button, action="DOWN")
                         if event.button in FACE_BUTTON_COLORS:
                             self._set_face_button_style(event.button, active=True)
+                        if event.button == CLAW_TOGGLE_BUTTON:
+                            self.toggle_claw_target()
+                        if event.button in PRESET_BUTTON_MAP:
+                            self._send_position_preset(PRESET_BUTTON_MAP[event.button])
                     elif event.type == pygame.JOYBUTTONUP:
                         self.cmd_worker.enqueue("button", button_id=event.button, action="UP")
                         if event.button in FACE_BUTTON_COLORS:
                             self._set_face_button_style(event.button, active=False)
+
+                # Triggers are analog axes, not buttons — detect press/release by threshold
+                for axis_idx, trigger_name in TRIGGER_AXIS_MAP.items():
+                    if axis_idx < self.joystick.get_numaxes():
+                        val = self.joystick.get_axis(axis_idx)
+                        pressed = val > TRIGGER_THRESHOLD
+                        if pressed and not self._trigger_pressed[trigger_name]:
+                            self._send_position_preset(trigger_name)
+                        self._trigger_pressed[trigger_name] = pressed
             else:
                 # No input - zero everything
                 self.joystick_values = {'lx': 0.0, 'ly': 0.0, 'rx': 0.0, 'ry': 0.0}

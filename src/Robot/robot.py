@@ -381,6 +381,13 @@ class RobotServer:
             "y_in": 0.0,
             "heading_deg": 0.0,
         }
+        self.last_optical_velocity: Dict[str, float] = {
+            "vx_in_s": 0.0,
+            "vy_in_s": 0.0,
+            "vh_deg_s": 0.0,
+        }
+        self.angular_vel_offset_dps: float = 0.0   # operator-supplied bias correction
+        self._optical_correction_deg: float = 0.0  # accumulated heading correction from offset
     
         self.pose_x_m, self.pose_y_m, self.pose_theta_deg = self._alliance_start_pose()
         self.last_pose_update = time.time()
@@ -399,6 +406,11 @@ class RobotServer:
 
         self.elevator_pid = ElevatorPID()
         self.arm_pid = ArmPID()
+        self.claw_state: Dict[str, Any] = {
+            "channel": 0,
+            "target": "open",
+            "setpoint": 0.0,
+        }
 
         self.telemetry_data: Dict[str, Any] = {
             "battery": 12.5,
@@ -424,6 +436,9 @@ class RobotServer:
                     "x_in": 0.0,
                     "y_in": 0.0,
                     "heading_deg": 0.0,
+                    "vh_deg_s": 0.0,
+                    "vh_deg_s_corrected": 0.0,
+                    "angular_vel_offset_dps": 0.0,
                 },
             },
             "encoders": [],
@@ -434,6 +449,7 @@ class RobotServer:
             "auto": self._build_auto_status(),
             "elevator": self.elevator_pid.as_dict(),
             "arm": self.arm_pid.as_dict(),
+            "claw": dict(self.claw_state),
         }
     
         try:
@@ -629,6 +645,7 @@ class RobotServer:
         self.optical_origin_x_m = self.pose_x_m
         self.optical_origin_y_m = self.pose_y_m
         self.optical_origin_heading_deg = self.pose_theta_deg
+        self._optical_correction_deg = 0.0  # restart accumulation from the new origin
 
         if self.optical_sensor_connected and self.optical_sensor is not None and reset_sensor:
             try:
@@ -642,12 +659,26 @@ class RobotServer:
             return False
 
         try:
+            now = time.time()
+            dt = max(0.0, min(0.2, now - self.last_pose_update))
+            self.last_pose_update = now
+
             pose = self.optical_sensor.read_pose()
             self.last_optical_pose = pose
 
+            # Read velocity for telemetry and accumulate heading correction.
+            try:
+                vel = self.optical_sensor.read_velocity()
+                self.last_optical_velocity = vel
+            except Exception:
+                pass  # sensor may not support getVelocity; keep last value
+
+            # Accumulate bias correction: offset_dps * dt removes the drift.
+            self._optical_correction_deg += self.angular_vel_offset_dps * dt
+
             optical_x_m = pose["x_in"] * INCHES_TO_METERS
             optical_y_m = pose["y_in"] * INCHES_TO_METERS
-            optical_heading_deg = pose["heading_deg"]
+            optical_heading_deg = pose["heading_deg"] + self._optical_correction_deg
 
             self.pose_x_m = max(0.0, min(FIELD_WIDTH_M, self.optical_origin_x_m + optical_x_m))
             self.pose_y_m = max(0.0, min(FIELD_HEIGHT_M, self.optical_origin_y_m + optical_y_m))
@@ -691,11 +722,15 @@ class RobotServer:
             "theta_deg": self.pose_theta_deg,
         }
         self.telemetry_data["alliance"] = self.alliance
+        raw_vh = self.last_optical_velocity.get("vh_deg_s", 0.0)
         self.telemetry_data["sensors"]["optical_odometry"] = {
             "connected": self.optical_sensor_connected,
             "x_in": self.last_optical_pose.get("x_in", 0.0),
             "y_in": self.last_optical_pose.get("y_in", 0.0),
             "heading_deg": self.last_optical_pose.get("heading_deg", 0.0),
+            "vh_deg_s": raw_vh,
+            "vh_deg_s_corrected": raw_vh + self.angular_vel_offset_dps,
+            "angular_vel_offset_dps": self.angular_vel_offset_dps,
         }
         self.telemetry_data["auto"] = self._build_auto_status()
 
@@ -1088,6 +1123,25 @@ class RobotServer:
                     "auto": self._start_auto_routine("auto_drive_to_pose", [step]),
                 }
 
+            elif cmd_type == "gyro_offset":
+                offset = float(command.get("offset_dps", 0.0))
+                self.angular_vel_offset_dps = offset
+                self._optical_correction_deg = 0.0  # reset accumulator when offset changes
+                logger.info("Gyro offset set to %.3f °/s", offset)
+                return {"status": "success", "angular_vel_offset_dps": offset}
+
+            elif cmd_type == "voltage":
+                # §4.4.9 — remote voltage output enable/disable via FMS signal.
+                # Relay 0 gates the voltage output circuit: ON when a voltage
+                # level is required (> 0), OFF to disable output entirely.
+                volts = float(command.get("voltage", 0.0))
+                enabled = volts > 0.0
+                if self.bridge:
+                    self.bridge.set_relay(enabled)
+                self.telemetry_data["relay"] = int(enabled)
+                logger.info("Voltage command: %.0fV relay=%s", volts, enabled)
+                return {"status": "success", "relay": int(enabled), "voltage": volts}
+
             elif cmd_type == "alliance":
                 new_alliance = str(command.get("alliance", self.alliance)).upper()
 
@@ -1201,6 +1255,22 @@ class RobotServer:
                 self.telemetry_data["arm"] = self.arm_pid.as_dict(ticks)
                 logger.info("Arm PID disabled")
                 return {"status": "success"}
+
+            elif cmd_type == "claw_setpoint":
+                channel = int(command.get("channel", 0))
+                value = max(-1.0, min(1.0, float(command.get("value", 0.0))))
+                target = str(command.get("target", "custom")).lower()
+                ok = bool(self.bridge.set_servo(channel, value)) if self.bridge else False
+                self.claw_state = {
+                    "channel": channel,
+                    "target": target,
+                    "setpoint": value,
+                    "ok": ok,
+                }
+                self.telemetry_data["claw"] = dict(self.claw_state)
+                logger.info("Claw setpoint: channel=%d target=%s value=%.3f ok=%s",
+                            channel, target, value, ok)
+                return {"status": "success" if ok or self.bridge is None else "error", "claw": dict(self.claw_state)}
 
             else:
                 logger.warning(f"Unknown command: {cmd_type}")
