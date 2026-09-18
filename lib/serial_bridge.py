@@ -17,10 +17,12 @@ class SerialBridge:
         port: str = "/dev/ttyACM0",
         baudrate: int = 115200,
         read_timeout: float = 0.05,
+        reconnect_interval: float = 1.0,
     ) -> None:
         self.port = port
         self.baudrate = baudrate
         self.read_timeout = read_timeout
+        self.reconnect_interval = reconnect_interval
 
         self.ser: Optional[serial.Serial] = None
         self.running = False
@@ -52,6 +54,37 @@ class SerialBridge:
         self.rx_thread.start()
         self.send({"type": "ping"})
         logger.info("Serial bridge connected on %s @ %d", self.port, self.baudrate)
+
+    def _reconnect(self) -> None:
+        """Close the dead handle and keep retrying to reopen the port.
+
+        Runs on the rx thread. Blocks (with retries) until the port reopens
+        or the bridge is shut down — while blocked, ``self.ser`` is None so
+        ``send()``/``get_latest_telemetry()`` correctly report "not connected"
+        instead of writing into a dead handle.
+        """
+        with self.lock:
+            if self.ser is not None:
+                try:
+                    self.ser.close()
+                except Exception:
+                    pass
+                self.ser = None
+
+        logger.warning("Serial bridge disconnected from %s; attempting to reconnect", self.port)
+
+        while self.running:
+            try:
+                new_ser = serial.Serial(self.port, self.baudrate, timeout=self.read_timeout)
+            except Exception:
+                time.sleep(self.reconnect_interval)
+                continue
+
+            with self.lock:
+                self.ser = new_ser
+            logger.warning("Serial bridge reconnected on %s", self.port)
+            self.send({"type": "ping"})
+            return
 
     def close(self) -> None:
         self.running = False
@@ -145,10 +178,14 @@ class SerialBridge:
             logger.debug("Unhandled MCU message: %s", msg)
 
     def _read_loop(self) -> None:
-        assert self.ser is not None
-        while self.running and self.ser is not None:
+        while self.running:
+            ser = self.ser
+            if ser is None:
+                time.sleep(self.reconnect_interval)
+                continue
+
             try:
-                raw = self.ser.readline()
+                raw = ser.readline()
                 if not raw:
                     continue
 
@@ -167,4 +204,4 @@ class SerialBridge:
 
             except Exception as e:
                 logger.error("Serial read failed: %s", e)
-                time.sleep(0.1)
+                self._reconnect()

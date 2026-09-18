@@ -25,6 +25,14 @@ AUTO_ANGLE_TOLERANCE_DEG = 4.0
 AUTO_STEP_TIMEOUT_S = 8.0
 
 ENABLE_CAMERA_BROADCAST = _is_truthy_env("KSU_ENABLE_CAMERA_BROADCAST", "1")
+
+# Advertises this robot on the LAN via mDNS/DNS-SD (see lib/mdns.py) so the
+# driver station can find it without a hardcoded IP. Purely additive — the
+# driver station's static ROBOT_ADDRESSES list in lib/comm.py still works as
+# a fallback if mDNS is unavailable or blocked on a given network.
+ENABLE_MDNS_DISCOVERY = _is_truthy_env("KSU_ENABLE_MDNS_DISCOVERY", "1")
+MDNS_INSTANCE_NAME = os.environ.get("KSU_MDNS_INSTANCE_NAME", "KSU-Storm-Robot")
+
 USE_PCA9685_PWM = os.environ.get("KSU_PWM_BACKEND", "pca").strip().lower() in ("pca", "pca9685")
 
 if USE_PCA9685_PWM:
@@ -48,6 +56,22 @@ MOTOR_DIRECTION_MULTIPLIER = (
     float(os.environ.get("KSU_MOTOR_RL_SIGN", "1.0")),
     float(os.environ.get("KSU_MOTOR_RR_SIGN", "1.0")),
 )
+
+# Elevator/arm mechanisms — not used by this season's game, but kept wired
+# up (subsystems/elevator.py, subsystems/arm.py) so a future season that
+# brings back a lift or a pivoting arm can flip these on instead of
+# rewriting the control code from scratch.
+ENABLE_ELEVATOR = _is_truthy_env("KSU_ENABLE_ELEVATOR", "0")
+ENABLE_ARM = _is_truthy_env("KSU_ENABLE_ARM", "0")
+
+# Where each mechanism lives in the 3-slot mech command/encoder arrays if
+# installed (see HARDWARE_README.md's mechanism motor/encoder tables).
+ELEVATOR_LEFT_MOTOR_INDEX = 0
+ELEVATOR_RIGHT_MOTOR_INDEX = 1
+ELEVATOR_LEFT_ENCODER_INDEX = 4
+ELEVATOR_RIGHT_ENCODER_INDEX = 5
+ARM_MOTOR_INDEX = 2
+ARM_ENCODER_INDEX = 6
 
 # Arm motor encoder resolution.
 # Set to actual ticks-per-revolution including gearbox.

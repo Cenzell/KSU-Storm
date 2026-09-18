@@ -1,0 +1,20 @@
+# Dependencies for src/Robot (runs on the Raspberry Pi coprocessor).
+#
+# picamera2 is best installed via apt, not pip, so that it matches the
+# libcamera build on the Pi's OS image:
+#   sudo apt install python3-picamera2 --no-install-recommends
+# It's listed here for reference; leave it commented out unless your pip
+# environment specifically needs it (e.g. system-site-packages venv).
+
+pyzmq
+zeroconf
+pyserial
+gpiozero
+adafruit-blinka
+adafruit-circuitpython-pca9685
+sparkfun-qwiic-otos
+opencv-python
+numpy
+pupil-apriltags
+smbus2
+# picamera2

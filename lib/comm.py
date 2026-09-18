@@ -10,7 +10,15 @@ from typing import Optional
 import zmq
 from PyQt6.QtCore import QObject, pyqtSignal
 
+try:
+    from mdns import ServiceDiscoverer
+except Exception:
+    ServiceDiscoverer = None
+
 # Configuration
+# Fallback candidates, tried only after any robot(s) found via mDNS
+# (see lib/mdns.py) — kept in case mDNS is unavailable or blocked on a
+# given network (e.g. some competition field networks disable multicast).
 ROBOT_ADDRESSES = [
     "10.10.89.3",
     "10.42.0.85",
@@ -35,19 +43,21 @@ class WorkerSignals(QObject):
 class RobotClient:
     """Client that manages command (REQ/REP) and telemetry (SUB) sockets."""
 
-    def __init__(self, robot_ip: str):
+    def __init__(self, robot_ip: str, command_port: int = COMMAND_PORT, telemetry_port: int = TELEMETRY_PORT):
         self.robot_ip = robot_ip
+        self.command_port = command_port
+        self.telemetry_port = telemetry_port
         self.context = zmq.Context()
         self.signals = WorkerSignals()
         self.command_lock = threading.Lock()
 
         self.command_socket = self.context.socket(zmq.REQ)
-        self.command_socket.connect(f"tcp://{robot_ip}:{COMMAND_PORT}")
+        self.command_socket.connect(f"tcp://{robot_ip}:{command_port}")
         self.command_socket.setsockopt(zmq.RCVTIMEO, COMMAND_TIMEOUT_MS)
         self.command_socket.setsockopt(zmq.LINGER, 0)
 
         self.telemetry_socket = self.context.socket(zmq.SUB)
-        self.telemetry_socket.connect(f"tcp://{robot_ip}:{TELEMETRY_PORT}")
+        self.telemetry_socket.connect(f"tcp://{robot_ip}:{telemetry_port}")
         self.telemetry_socket.subscribe("")
         self.telemetry_socket.setsockopt(zmq.RCVTIMEO, TELEMETRY_TIMEOUT_MS)
         self.telemetry_socket.setsockopt(zmq.LINGER, 0)
@@ -57,7 +67,7 @@ class RobotClient:
         self.last_ping_time = 0
         self.ping_sent_time = None
 
-        print(f"[RobotClient] Initialized connection to {robot_ip}")
+        print(f"[RobotClient] Initialized connection to {robot_ip}:{command_port}")
 
     def _set_connected(self, connected: bool) -> None:
         if self.connected == connected:
@@ -131,7 +141,14 @@ class RobotClient:
 
 
 class ConnectionManager(threading.Thread):
-    """Manage connection attempts across candidate robot addresses."""
+    """Manage connection attempts across candidate robot addresses.
+
+    Candidates come from two sources: robots discovered live via mDNS
+    (lib/mdns.py) are always tried first, followed by the static
+    ROBOT_ADDRESSES fallback list. mDNS discovery is best-effort — if the
+    zeroconf package is missing or discovery fails to start, this class
+    silently falls back to exactly the old static-list-only behavior.
+    """
 
     def __init__(self):
         super().__init__()
@@ -142,8 +159,36 @@ class ConnectionManager(threading.Thread):
         self.current_address_idx = 0
         self.daemon = True
 
+        self._discovery_lock = threading.Lock()
+        self._discovered: dict[str, tuple[str, int, int]] = {}
+        self._discoverer = None
+        if ServiceDiscoverer is not None:
+            try:
+                self._discoverer = ServiceDiscoverer(on_change=self._on_service_change)
+                print("[ConnectionManager] mDNS discovery active")
+            except Exception as e:
+                print(f"[ConnectionManager] mDNS discovery unavailable: {e}")
+                self._discoverer = None
+        else:
+            print("[ConnectionManager] mDNS discovery unavailable (zeroconf not installed)")
+
+    def _on_service_change(self, name: str, address: Optional[str], command_port: int, telemetry_port: int) -> None:
+        with self._discovery_lock:
+            if address is None:
+                self._discovered.pop(name, None)
+                print(f"[ConnectionManager] mDNS: lost {name}")
+            else:
+                self._discovered[name] = (address, command_port, telemetry_port or TELEMETRY_PORT)
+                print(f"[ConnectionManager] mDNS: found {name} at {address}:{command_port}")
+
+    def _candidates(self) -> list[tuple[str, int, int]]:
+        with self._discovery_lock:
+            discovered = list(self._discovered.values())
+        static = [(ip, COMMAND_PORT, TELEMETRY_PORT) for ip in ROBOT_ADDRESSES]
+        return discovered + static
+
     def _advance_address(self) -> None:
-        self.current_address_idx = (self.current_address_idx + 1) % len(ROBOT_ADDRESSES)
+        self.current_address_idx += 1
 
     def run(self) -> None:
         print("[ConnectionManager] Starting...")
@@ -151,28 +196,32 @@ class ConnectionManager(threading.Thread):
         while self.running:
             with self.lock:
                 if self.client is None or not self.client.connected:
-                    address = ROBOT_ADDRESSES[self.current_address_idx]
-                    print(f"[ConnectionManager] Attempting {address}...")
+                    candidates = self._candidates()
+                    if not candidates:
+                        self.client = None
+                    else:
+                        address, command_port, telemetry_port = candidates[self.current_address_idx % len(candidates)]
+                        print(f"[ConnectionManager] Attempting {address}:{command_port}...")
 
-                    try:
-                        if self.client:
-                            self.client.cleanup()
+                        try:
+                            if self.client:
+                                self.client.cleanup()
 
-                        self.client = RobotClient(address)
-                        self.client.signals = self.signals
+                            self.client = RobotClient(address, command_port, telemetry_port)
+                            self.client.signals = self.signals
 
-                        response = self.client.send_ping()
-                        if response and response.get("status") == "success":
-                            print(f"[ConnectionManager] ✅ Connected to {address}")
-                            self.signals.connection_status.emit(True, f"{address}:{COMMAND_PORT}")
-                        else:
+                            response = self.client.send_ping()
+                            if response and response.get("status") == "success":
+                                print(f"[ConnectionManager] ✅ Connected to {address}:{command_port}")
+                                self.signals.connection_status.emit(True, f"{address}:{command_port}")
+                            else:
+                                self._advance_address()
+                                self.client = None
+                        except Exception as e:
+                            print(f"[ConnectionManager] Connection failed: {e}")
                             self._advance_address()
                             self.client = None
-                    except Exception as e:
-                        print(f"[ConnectionManager] Connection failed: {e}")
-                        self._advance_address()
-                        self.client = None
-                        self.signals.connection_status.emit(False, "")
+                            self.signals.connection_status.emit(False, "")
 
             time.sleep(1.0 if self.client is None else 0.5)
 
@@ -185,6 +234,11 @@ class ConnectionManager(threading.Thread):
         with self.lock:
             if self.client:
                 self.client.cleanup()
+        if self._discoverer:
+            try:
+                self._discoverer.close()
+            except Exception:
+                pass
 
 
 class TelemetryReceiver(threading.Thread):

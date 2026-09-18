@@ -1,1 +1,13 @@
 target
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.codex
+.gitignore
+
+# OS
+.DS_Store

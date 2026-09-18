@@ -1,0 +1,7 @@
+# Dependencies for src/DriverStation (runs on the driver's laptop, not the Pi).
+
+PyQt6
+pyzmq
+zeroconf
+pygame
+numpy
