@@ -52,6 +52,13 @@ class ServiceAdvertiser:
     def __init__(self, instance_name: str, command_port: int, telemetry_port: int) -> None:
         self.instance_name = instance_name
         address = local_ipv4()
+        # Explicitly point the SRV record at this machine's real mDNS
+        # hostname (e.g. "raspberrypi.local.") rather than letting zeroconf
+        # default it to the service instance name — callers that want to
+        # know *which Pi* this is (e.g. an SSH/rsync deploy target) need
+        # the actual hostname, not our app-level service name.
+        hostname = socket.gethostname()
+        server = hostname if hostname.endswith(".local.") else f"{hostname}.local."
         self._zc = Zeroconf()
         self._info = ServiceInfo(
             SERVICE_TYPE,
@@ -59,10 +66,11 @@ class ServiceAdvertiser:
             addresses=[socket.inet_aton(address)],
             port=command_port,
             properties={"telemetry_port": str(telemetry_port)},
+            server=server,
         )
         self._zc.register_service(self._info)
-        logger.info("mDNS: advertising %s at %s:%d (telemetry %d)",
-                    instance_name, address, command_port, telemetry_port)
+        logger.info("mDNS: advertising %s at %s:%d (telemetry %d, hostname %s)",
+                    instance_name, address, command_port, telemetry_port, server)
 
     def close(self) -> None:
         try:
@@ -75,8 +83,11 @@ class ServiceAdvertiser:
             pass
 
 
-# (name, address_or_None, command_port, telemetry_port) — address is None on removal.
-DiscoveryCallback = Callable[[str, Optional[str], int, int], None]
+# (name, address_or_None, command_port, telemetry_port, hostname) — address
+# and hostname are None on removal. hostname is the advertising machine's
+# real mDNS hostname (e.g. "raspberrypi.local."), distinct from `name` which
+# is the app-level service instance name.
+DiscoveryCallback = Callable[[str, Optional[str], int, int, Optional[str]], None]
 
 
 class ServiceDiscoverer:
@@ -90,7 +101,7 @@ class ServiceDiscoverer:
     def _handle(self, zeroconf: Zeroconf, service_type: str, name: str,
                 state_change: ServiceStateChange) -> None:
         if state_change is ServiceStateChange.Removed:
-            self._on_change(name, None, 0, 0)
+            self._on_change(name, None, 0, 0, None)
             return
 
         try:
@@ -104,7 +115,8 @@ class ServiceDiscoverer:
 
         address = socket.inet_ntoa(info.addresses[0])
         telemetry_port = int(info.properties.get(b"telemetry_port", b"0") or 0)
-        self._on_change(name, address, info.port, telemetry_port)
+        hostname = info.server.rstrip(".") if info.server else None
+        self._on_change(name, address, info.port, telemetry_port, hostname)
 
     def close(self) -> None:
         try:

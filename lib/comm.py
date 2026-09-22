@@ -172,14 +172,19 @@ class ConnectionManager(threading.Thread):
         else:
             print("[ConnectionManager] mDNS discovery unavailable (zeroconf not installed)")
 
-    def _on_service_change(self, name: str, address: Optional[str], command_port: int, telemetry_port: int) -> None:
+    def _on_service_change(self, name: str, address: Optional[str], command_port: int,
+                            telemetry_port: int, hostname: Optional[str]) -> None:
         with self._discovery_lock:
             if address is None:
                 self._discovered.pop(name, None)
                 print(f"[ConnectionManager] mDNS: lost {name}")
             else:
+                # Connect by IP, not hostname: more robust, since it doesn't
+                # depend on the OS's own mDNS resolver working. hostname is
+                # only used for the log line / tools like scripts/find_robot.py.
                 self._discovered[name] = (address, command_port, telemetry_port or TELEMETRY_PORT)
-                print(f"[ConnectionManager] mDNS: found {name} at {address}:{command_port}")
+                where = f"{address} ({hostname})" if hostname else address
+                print(f"[ConnectionManager] mDNS: found {name} at {where}:{command_port}")
 
     def _candidates(self) -> list[tuple[str, int, int]]:
         with self._discovery_lock:
