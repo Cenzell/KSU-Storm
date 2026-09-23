@@ -16,7 +16,7 @@
   "claw": {
     "open": -1.0,
     "closed": 1.0,
-    "target": "open"
+    "target": "closed"
   },
   "position_presets": {
     "LB": {

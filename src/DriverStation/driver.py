@@ -43,6 +43,7 @@ MAX_ANGULAR_SPEED_DPS = 180.0
 EXPECTED_POSE_HORIZON_S = 0.35
 SLOW_DRIVE_SCALE = 0.2
 AXIS_DEADZONE = 0.03
+START_WALL_OFFSET_IN = 24  # starting distance from the side wall to the robot's center
 
 FACE_BUTTON_COLORS = {
     0: "green",   # A
@@ -264,11 +265,12 @@ class AppWindow(DriverUIHelpers, QMainWindow):
 
     def _alliance_start_pose(self):
         half_robot = 18.0 * 0.0254 / 2.0
-        start_y = half_robot
-        start_theta = 90.0
+        wall_inset = START_WALL_OFFSET_IN * 0.0254
         if self.current_alliance == "BLUE":
-            return self.field_widget.field_width_m - half_robot, start_y, start_theta
-        return half_robot, start_y, start_theta
+            # Bottom-right of the field image, facing up (into the field).
+            return self.field_widget.field_width_m - wall_inset, half_robot, 90.0
+        # Top-left of the field image, facing down (into the field).
+        return wall_inset, self.field_widget.field_height_m - half_robot, 270.0
 
     def _update_alliance_button(self):
         if not hasattr(self, "btn_auto_3"):

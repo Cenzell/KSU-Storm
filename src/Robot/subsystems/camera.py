@@ -180,40 +180,14 @@ class CameraWorker:
 def default_camera_configs() -> Dict[str, CameraConfig]:
     shared_calibration = _env("KSU_CAMERA_CALIBRATION_FILE", "camera_calibration.json")
     return {
-        # USB camera, OpenCV index 0.
-        "front_left": CameraConfig(
-            name="front_left",
-            label=_env("KSU_CAMERA_FRONT_LEFT_LABEL", "Front Left"),
-            backend=_env("KSU_CAMERA_FRONT_LEFT_BACKEND", "opencv"),
-            selector=_env("KSU_CAMERA_FRONT_LEFT_SELECTOR", "0"),
-            width=int(_env("KSU_CAMERA_FRONT_LEFT_WIDTH", str(DEFAULT_WIDTH))),
-            height=int(_env("KSU_CAMERA_FRONT_LEFT_HEIGHT", str(DEFAULT_HEIGHT))),
-            calibration_file=_env(
-                "KSU_CAMERA_FRONT_LEFT_CALIBRATION_FILE",
-                shared_calibration,
-            ),
-            enable_apriltag=_is_truthy_env("KSU_CAMERA_FRONT_LEFT_ENABLE_APRILTAG", "1"),
-        ),
-        # USB camera, OpenCV index 1.
-        "front_right": CameraConfig(
-            name="front_right",
-            label=_env("KSU_CAMERA_FRONT_RIGHT_LABEL", "Front Right"),
-            backend=_env("KSU_CAMERA_FRONT_RIGHT_BACKEND", "opencv"),
-            selector=_env("KSU_CAMERA_FRONT_RIGHT_SELECTOR", "1"),
-            width=int(_env("KSU_CAMERA_FRONT_RIGHT_WIDTH", str(DEFAULT_WIDTH))),
-            height=int(_env("KSU_CAMERA_FRONT_RIGHT_HEIGHT", str(DEFAULT_HEIGHT))),
-            calibration_file=_env(
-                "KSU_CAMERA_FRONT_RIGHT_CALIBRATION_FILE",
-                shared_calibration,
-            ),
-            enable_apriltag=_is_truthy_env("KSU_CAMERA_FRONT_RIGHT_ENABLE_APRILTAG", "1"),
-        ),
-        # Primary driver view — Pi camera on CSI connector 0.
-        # AprilTag annotation disabled: overlays are distracting for the driver.
+        # USB camera, OpenCV index 0. Only camera physically connected for now —
+        # front_left (index 0, opencv) and front_right (index 1) are disabled
+        # until that hardware is present; re-add their CameraConfig entries
+        # here when it is.
         "driver": CameraConfig(
             name="driver",
             label=_env("KSU_CAMERA_DRIVER_LABEL", "Driver"),
-            backend=_env("KSU_CAMERA_DRIVER_BACKEND", "picamera2"),
+            backend=_env("KSU_CAMERA_DRIVER_BACKEND", "opencv"),
             selector=_env("KSU_CAMERA_DRIVER_SELECTOR", "0"),
             width=int(_env("KSU_CAMERA_DRIVER_WIDTH", str(DEFAULT_WIDTH))),
             height=int(_env("KSU_CAMERA_DRIVER_HEIGHT", str(DEFAULT_HEIGHT))),

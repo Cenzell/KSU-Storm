@@ -20,7 +20,7 @@ except Exception:
 # (see lib/mdns.py) — kept in case mDNS is unavailable or blocked on a
 # given network (e.g. some competition field networks disable multicast).
 ROBOT_ADDRESSES = [
-    "10.10.89.3",
+    "10.42.0.86",
     "10.42.0.85",
     "10.42.0.3",
     "10.42.0.2",

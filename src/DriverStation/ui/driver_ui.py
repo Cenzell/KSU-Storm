@@ -41,16 +41,14 @@ logger = logging.getLogger(__name__)
 CAMERA_RECONNECT_MS = 1500
 DRIVERSTATION_DIR = Path(__file__).resolve().parents[1]
 PROJECT_ROOT = DRIVERSTATION_DIR.parents[1]
-FIELD_IMAGE_PATH = DRIVERSTATION_DIR / "field.png"
+FIELD_IMAGE_PATH = DRIVERSTATION_DIR / "field2027.png"
 ROBOT_SIZE_M = 18.0 * 0.0254
 DEFAULT_ROBOT_ADDRESSES = [
-    "10.10.89.3",
+    #"10.10.89.3",
     "10.42.0.85",
     "10.42.0.3",
-    "10.42.0.2",
-    "127.0.0.1",
-    "10.91.75.23",
-    "10.222.255.253",
+    #"10.42.0.2",
+    "127.0.0.1"
 ]
 
 
@@ -62,7 +60,7 @@ class CameraFeedConfig:
 
 
 def build_camera_feed_configs():
-    base_url = os.environ.get("KSU_CAMERA_BASE_URL", "http://10.10.89.3:8080").rstrip("/")
+    base_url = os.environ.get("KSU_CAMERA_BASE_URL", "http://10.42.0.86:8080").rstrip("/")
     return [
         CameraFeedConfig(
             name="front_left",
@@ -188,12 +186,20 @@ class FieldWidget(QWidget):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
 
         margin = 12
-        draw_rect = QRectF(
-            margin,
-            margin,
-            max(10, self.width() - 2 * margin),
-            max(10, self.height() - 2 * margin),
-        )
+        available_width = max(10, self.width() - 2 * margin)
+        available_height = max(10, self.height() - 2 * margin)
+
+        target_ratio = self.field_width_m / self.field_height_m
+        if available_width / available_height > target_ratio:
+            draw_height = available_height
+            draw_width = draw_height * target_ratio
+        else:
+            draw_width = available_width
+            draw_height = draw_width / target_ratio
+
+        offset_x = margin + (available_width - draw_width) / 2.0
+        offset_y = margin + (available_height - draw_height) / 2.0
+        draw_rect = QRectF(offset_x, offset_y, draw_width, draw_height)
 
         if not self.field_background.isNull():
             scaled_background = self.field_background.scaled(

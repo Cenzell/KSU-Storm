@@ -5,3 +5,4 @@ pyzmq
 zeroconf
 pygame
 numpy
+opencv-python
